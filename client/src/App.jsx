@@ -33,6 +33,95 @@ const sevTone = (s) =>
     ? "blue"
     : "neutral";
 
+// ——— Fault helpers (normalize Samsara-style SPN/FMI JSON into our UI model) ———
+function normalizeFaultItems(items = [], context = {}) {
+  // items: array like the sample { spnId, spnDescription, fmiId, fmiDescription, milStatus, ... }
+  // returns {active: [...], counts: {...}, history: [...] }
+  const active = [];
+  const nowIso = new Date().toISOString();
+
+  for (const it of items) {
+    const spn = it.spnId != null ? Number(it.spnId) : undefined;
+    const fmi = it.fmiId != null ? Number(it.fmiId) : undefined;
+    const code = [
+      spn != null ? `SPN ${spn}` : null,
+      fmi != null ? `FMI ${fmi}` : null,
+    ]
+      .filter(Boolean)
+      .join(" ");
+
+    const src = it.sourceAddressName || "Unknown Module";
+    const desc =
+      it.spnDescription || it.fmiDescription || "Diagnostic trouble code";
+
+    // Basic rule-of-thumb severity: MIL on + misfire = critical, MIL on otherwise = warning, else info.
+    const misfire =
+      /misfire/i.test(desc) || spn === 1322 || spn === 1327 || spn === 1328;
+    const severity =
+      misfire && it.milStatus === 1
+        ? "critical"
+        : it.milStatus === 1
+        ? "warning"
+        : "info";
+
+    active.push({
+      id: `${context.id || context.vin || "veh"}:${spn || "?"}:${
+        fmi || "?"
+      }:${src}`,
+      code,
+      description: `${desc} (${src})`,
+      severity,
+      time: nowIso,
+      active: true,
+      meta: {
+        spn,
+        fmi,
+        spnDescription: it.spnDescription,
+        fmiDescription: it.fmiDescription,
+        milStatus: it.milStatus,
+        occurrenceCount: it.occurrenceCount,
+        sourceAddressName: src,
+        txId: it.txId,
+      },
+    });
+  }
+
+  // counts
+  const counts = { critical: 0, warning: 0, info: 0, unknown: 0 };
+  for (const f of active) {
+    if (counts[f.severity] != null) counts[f.severity]++;
+    else counts.unknown++;
+  }
+
+  return { active, counts, history: [] };
+}
+
+// merge faults into an existing row.faults
+function mergeFaults(prev = {}, patch = {}) {
+  const active = [...(prev.active || [])];
+  const seen = new Set(active.map((f) => f.id));
+  for (const f of patch.active || []) {
+    if (!seen.has(f.id)) {
+      active.push(f);
+      seen.add(f.id);
+    } else {
+      // update existing (time, severity, description)
+      const i = active.findIndex((x) => x.id === f.id);
+      if (i >= 0) active[i] = { ...active[i], ...f };
+    }
+  }
+  // recompute counts
+  const counts = { critical: 0, warning: 0, info: 0, unknown: 0 };
+  for (const f of active) {
+    if (counts[f.severity] != null) counts[f.severity]++;
+    else counts.unknown++;
+  }
+  const history = [...(prev.history || []), ...(patch.history || [])].slice(
+    -500
+  );
+  return { active, counts, history };
+}
+
 /* ---------- theme (Auto/Light/Dark) ---------- */
 function useTheme() {
   const getInitial = () => localStorage.getItem("themeMode") || "auto";
@@ -60,7 +149,19 @@ function useTheme() {
 export default function App() {
   const [themeMode, setThemeMode] = useTheme();
 
-  const [rows, setRows] = useState(() => new Map());
+  const [rows, setRows] = useState(() => {
+    // Offline warm start
+    try {
+      const cached = JSON.parse(
+        localStorage.getItem("lastSnapshotRows") || "[]"
+      );
+      const m = new Map();
+      for (const it of cached) m.set(it.id, it);
+      return m;
+    } catch {
+      return new Map();
+    }
+  });
   const [connected, setConnected] = useState(false);
   const [now, setNow] = useState(() => new Date());
 
@@ -99,6 +200,15 @@ export default function App() {
   const [onlyFav, setOnlyFav] = useState(
     () => localStorage.getItem("onlyFav") === "1"
   );
+
+  // NEW: acknowledge faults (local)
+  const [ack, setAck] = useState(() => {
+    try {
+      return new Set(JSON.parse(localStorage.getItem("ackFaultIds") || "[]"));
+    } catch {
+      return new Set();
+    }
+  });
 
   // faults: alerting + snooze
   const [snoozeUntil, setSnoozeUntil] = useState(() =>
@@ -154,6 +264,11 @@ export default function App() {
       localStorage.setItem("favorites", JSON.stringify([...favorites]));
     } catch {}
   }, [favorites]);
+  useEffect(() => {
+    try {
+      localStorage.setItem("ackFaultIds", JSON.stringify([...ack]));
+    } catch {}
+  }, [ack]);
 
   // notifications permission (optional)
   const ensureNotifs = () => {
@@ -210,6 +325,7 @@ export default function App() {
     socket.on("connect", () => setConnected(true));
     socket.on("disconnect", () => setConnected(false));
 
+    // snapshot (cache for warm start)
     socket.on("snapshot", (items) => {
       const m = new Map();
       const hist = new Map(historyRef.current);
@@ -237,6 +353,14 @@ export default function App() {
       lastEventsRef.current = ev;
       setRows(m);
       setLastSnapshotCount(items.length);
+
+      // persist a compressed view (array for localStorage)
+      try {
+        localStorage.setItem(
+          "lastSnapshotRows",
+          JSON.stringify(Array.from(m.values()))
+        );
+      } catch {}
     });
 
     socket.on("update", (item) => {
@@ -270,21 +394,102 @@ export default function App() {
       lastEventsRef.current = ev;
     });
 
-    // NEW: faults stream
+    // NEW: raw "fault" events from legacy topic (kept as-is)
     socket.on("fault", (payload) => {
-      // Alert on critical, honor snooze
+      // expect: {id/vin, code, description, severity}
       const isCritical = (payload.severity || "").toLowerCase() === "critical";
       const snoozed = Date.now() < snoozeUntil;
+
+      setRows((prev) => {
+        const next = new Map(prev);
+        const key = payload.id || payload.vin;
+        if (!key) return prev;
+        const row = next.get(key) || { id: key, vin: payload.vin };
+        const merged = {
+          ...row,
+          faults: mergeFaults(row.faults, {
+            active: [
+              {
+                id: `${key}:${payload.code}`,
+                code: payload.code,
+                description: payload.description || "Fault",
+                severity: payload.severity || "info",
+                time: payload.time || new Date().toISOString(),
+                active: true,
+              },
+            ],
+            history: [],
+          }),
+          lastUpdateTs: Date.now(),
+        };
+        next.set(key, merged);
+        return next;
+      });
+
       if (isCritical && !snoozed) {
-        beep();
-        ensureNotifs();
-        if ("Notification" in window && Notification.permission === "granted") {
-          new Notification(`Critical fault ${payload.code}`, {
-            body: `${payload.vin || payload.id}: ${
-              payload.description || "Fault"
-            }`,
-          });
-        }
+        try {
+          beep();
+          ensureNotifs();
+          if (
+            "Notification" in window &&
+            Notification.permission === "granted"
+          ) {
+            new Notification(`Critical fault ${payload.code}`, {
+              body: `${payload.vin || payload.id}: ${
+                payload.description || "Fault"
+              }`,
+            });
+          }
+        } catch {}
+      }
+    });
+
+    // NEW: support for the **new fault codes topic** you asked for
+    // Expect payload like: { id, vin, codes: [ {fmiDescription, fmiId, milStatus, occurrenceCount, sourceAddressName, spnDescription, spnId, txId}, ... ] }
+    socket.on("faultcodes", (payload) => {
+      const key = payload.id || payload.vin;
+      if (!key || !Array.isArray(payload.codes)) return;
+
+      const patch = normalizeFaultItems(payload.codes, {
+        id: key,
+        vin: payload.vin,
+      });
+
+      setRows((prev) => {
+        const next = new Map(prev);
+        const row = next.get(key) || { id: key, vin: payload.vin };
+        const merged = {
+          ...row,
+          faults: mergeFaults(row.faults, patch),
+          lastUpdateTs: Date.now(),
+          // quick flag if MIL is on for any of these
+          milOn: payload.codes.some((c) => c.milStatus === 1),
+        };
+        next.set(key, merged);
+        return next;
+      });
+
+      // optional alert on any newly critical faults
+      const anyCritical = (patch.active || []).some(
+        (f) => f.severity === "critical"
+      );
+      const snoozed = Date.now() < snoozeUntil;
+      if (anyCritical && !snoozed) {
+        try {
+          beep();
+          ensureNotifs();
+          if (
+            "Notification" in window &&
+            Notification.permission === "granted"
+          ) {
+            new Notification(`Critical diagnostic fault`, {
+              body: `${payload.vin || key}: ${
+                patch.active.find((f) => f.severity === "critical")?.code ||
+                "SPN/FMI"
+              }`,
+            });
+          }
+        } catch {}
       }
     });
 
@@ -349,6 +554,8 @@ export default function App() {
         return hasFaults;
       case "critical":
         return hasCritical;
+      case "mil":
+        return !!r.milOn;
       default:
         return true;
     }
@@ -369,10 +576,14 @@ export default function App() {
         r.city,
         r.state,
         r.lastTopic,
+        // search in faults: SPN/FMI, descriptions and source module
         ...(r.faults?.active || []).flatMap((f) => [
           f.code,
           f.description,
           f.severity,
+          f.meta?.spnDescription,
+          f.meta?.fmiDescription,
+          f.meta?.sourceAddressName,
         ]),
         r.lat != null && r.lon != null ? `${r.lat},${r.lon}` : "",
       ]
@@ -509,7 +720,7 @@ export default function App() {
                 id="global-search"
                 value={query}
                 onChange={setQuery}
-                placeholder="Search — VIN, ID, city, fault code…"
+                placeholder="Search — VIN, ID, city, SPN/FMI, source module…"
                 className="min-w-[220px] md:min-w-[320px]"
               />
               <Input
@@ -625,6 +836,14 @@ export default function App() {
                 mapProvider={mapProvider}
                 setMapProvider={setMapProvider}
                 onHelp={requestHelp}
+                ack={ack}
+                onAck={(faultId) =>
+                  setAck((prev) => {
+                    const next = new Set(prev);
+                    next.add(faultId);
+                    return next;
+                  })
+                }
               />
             ))}
           </div>
@@ -653,6 +872,14 @@ export default function App() {
           coordPrec={coordPrec}
           mapProvider={mapProvider}
           onHelp={requestHelp}
+          onAck={(faultId) =>
+            setAck((prev) => {
+              const next = new Set(prev);
+              next.add(faultId);
+              return next;
+            })
+          }
+          ack={ack}
         />
       )}
 
@@ -758,14 +985,6 @@ function FaultCounters({ faults, critical }) {
   );
 }
 
-function ResultCount({ count, total }) {
-  return (
-    <span className="inline-flex items-center gap-2 rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-sm text-neutral-700 shadow-sm dark:bg-neutral-900 dark:text-neutral-200 dark:border-neutral-800">
-      Showing <strong className="tabular-nums">{count}</strong> / {total}
-    </span>
-  );
-}
-
 function DensityToggle({ dense, onChange }) {
   return (
     <button
@@ -852,6 +1071,7 @@ function QuickFilters({ value, onChange }) {
       <Opt v="nogps" label="No GPS" />
       <Opt v="faults" label="Faulted" />
       <Opt v="critical" label="Critical" />
+      <Opt v="mil" label="MIL on" />
     </div>
   );
 }
@@ -870,6 +1090,8 @@ function AssetCard({
   mapProvider,
   setMapProvider,
   onHelp,
+  ack,
+  onAck,
 }) {
   const {
     id,
@@ -886,6 +1108,7 @@ function AssetCard({
     __hot,
     lastUpdateTs,
     faults,
+    milOn,
   } = row;
 
   const location = fmtLocation(city, state);
@@ -926,7 +1149,7 @@ function AssetCard({
         "shadow-[0_1px_0_0_rgba(0,0,0,0.02),0_10px_30px_-12px_rgba(0,0,0,0.15)]",
         "transition duration-200 hover:shadow-[0_1px_0_0_rgba(0,0,0,0.02),0_20px_50px_-16px_rgba(0,0,0,0.25)]",
         dense ? "p-3" : "p-4",
-        "flex flex-col min-h-[280px]"
+        "flex flex-col min-h-[300px]"
       )}
     >
       {/* Header */}
@@ -941,6 +1164,7 @@ function AssetCard({
               label="Copy"
               onCopy={() => onCopy?.("VIN copied")}
             />
+            {milOn ? <Badge tone="amber">MIL</Badge> : null}
             <button
               className={cx(
                 "rounded-lg px-2 py-1 text-[11px] ring-1 transition",
@@ -1051,15 +1275,29 @@ function AssetCard({
                   <span className="truncate" title={f.description}>
                     {truncateMiddle(f.description, 48)}
                   </span>
+                  {f.meta?.milStatus === 1 ? (
+                    <Badge tone="amber">MIL</Badge>
+                  ) : null}
+                  {ack?.has(f.id) ? (
+                    <Badge tone="neutral">Ack</Badge>
+                  ) : (
+                    <button
+                      className="ml-auto rounded-md px-2 py-0.5 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+                      onClick={() => onAck?.(f.id)}
+                      title="Acknowledge (local)"
+                    >
+                      Ack
+                    </button>
+                  )}
                   <button
-                    className="ml-auto rounded-md px-2 py-0.5 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+                    className="rounded-md px-2 py-0.5 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
                     onClick={() =>
                       onHelp?.({
                         id,
                         vin,
                         faultId: f.id,
                         code: f.code,
-                        note: "",
+                        note: f.description || "",
                       })
                     }
                     title="Request help"
@@ -1111,6 +1349,22 @@ function AssetCard({
 
 /* ---------------------------- Modal ---------------------------- */
 
+// Simple OSM embed helper (no API key). Keeps the map centered on latest lat/lon.
+function OsmMap({ lat, lon, zoom = 13, title = "Location" }) {
+  if (lat == null || lon == null) return null;
+  const delta = 0.02; // viewport box size
+  const bbox = [lon - delta, lat - delta, lon + delta, lat + delta].join("%2C");
+  const src = `https://www.openstreetmap.org/export/embed.html?bbox=${bbox}&layer=mapnik&marker=${lat}%2C${lon}`;
+  return (
+    <iframe
+      key={`${lat.toFixed(5)},${lon.toFixed(5)}`}
+      title={title}
+      className="w-full h-64 rounded-xl ring-1 ring-neutral-200 dark:ring-neutral-700"
+      src={src}
+    />
+  );
+}
+
 function DetailsModal({
   row,
   history,
@@ -1120,6 +1374,8 @@ function DetailsModal({
   coordPrec,
   mapProvider,
   onHelp,
+  onAck,
+  ack,
 }) {
   if (!row) return null;
   const {
@@ -1146,13 +1402,19 @@ function DetailsModal({
   const active = faults?.active || [];
   const histFaults = faults?.history || [];
 
+  // path points from recent events (for the trail preview under map)
+  const trail = (events || [])
+    .filter((e) => e.lat != null && e.lon != null)
+    .slice(-25)
+    .map((e) => ({ lat: e.lat, lon: e.lon }));
+
   return (
     <div className="fixed inset-0 z-[70]">
       <div
         className="absolute inset-0 bg-black/50 backdrop-blur-sm"
         onClick={onClose}
       />
-      <div className="absolute left-1/2 top-1/2 w-[min(100vw-2rem,1000px)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-neutral-200 bg-white shadow-2xl dark:bg-neutral-900 dark:border-neutral-800">
+      <div className="absolute left-1/2 top-1/2 w-[min(100vw-2rem,1100px)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-neutral-200 bg-white shadow-2xl dark:bg-neutral-900 dark:border-neutral-800">
         <div className="flex items-center justify-between gap-3 border-b border-neutral-100 p-4 dark:border-neutral-800">
           <div className="flex items-center gap-2">
             <Badge tone="violet">Details</Badge>
@@ -1208,6 +1470,18 @@ function DetailsModal({
 
             <div className="grid grid-cols-2 gap-2 pt-2">
               <Action
+                label="Request Help"
+                onClick={() =>
+                  onHelp?.({
+                    id,
+                    vin,
+                    faultId: active[0]?.id,
+                    code: active[0]?.code,
+                    note: active[0]?.description || "",
+                  })
+                }
+              />
+              <Action
                 label="Open in Maps"
                 onClick={() => {
                   if (lat != null && lon != null) {
@@ -1224,23 +1498,20 @@ function DetailsModal({
                 }}
                 disabled={lat == null || lon == null}
               />
-              <Action
-                label="Request Help"
-                onClick={() =>
-                  onHelp?.({
-                    id,
-                    vin,
-                    faultId: active[0]?.id,
-                    code: active[0]?.code,
-                    note: "",
-                  })
-                }
-              />
             </div>
           </div>
 
-          {/* Right: trends & faults */}
+          {/* Right: map, trends & faults */}
           <div className="space-y-3 md:col-span-2">
+            {/* Real-time map (OSM embed) */}
+            <div className="space-y-2">
+              <div className="text-xs text-neutral-500 dark:text-neutral-400">
+                Live location
+              </div>
+              <OsmMap lat={lat} lon={lon} title="Truck location" />
+              <TrailMini trail={trail} />
+            </div>
+
             <div className="rounded-xl ring-1 ring-neutral-200/70 bg-neutral-50 p-3 dark:bg-neutral-800 dark:ring-neutral-700">
               <div className="mb-2 text-xs text-neutral-500 dark:text-neutral-400">
                 Speed (recent)
@@ -1253,7 +1524,7 @@ function DetailsModal({
                 <div className="mb-2 text-xs text-neutral-500 dark:text-neutral-400">
                   Active faults
                 </div>
-                <div className="max-h-40 overflow-auto pr-1">
+                <div className="max-h-48 overflow-auto pr-1">
                   {active.length === 0 ? (
                     <div className="text-sm text-neutral-500">None</div>
                   ) : (
@@ -1262,6 +1533,7 @@ function DetailsModal({
                         <tr>
                           <th className="text-left px-2 py-1">Code</th>
                           <th className="text-left px-2 py-1">Severity</th>
+                          <th className="text-left px-2 py-1">MIL</th>
                           <th className="text-left px-2 py-1">When</th>
                           <th className="text-left px-2 py-1">Actions</th>
                         </tr>
@@ -1272,18 +1544,39 @@ function DetailsModal({
                             key={f.id}
                             className="odd:bg-white even:bg-neutral-50 dark:odd:bg-neutral-900 dark:even:bg-neutral-800/60"
                           >
-                            <td className="px-2 py-1 font-mono">{f.code}</td>
+                            <td className="px-2 py-1">
+                              <div className="font-mono">{f.code}</div>
+                              <div className="text-xs text-neutral-500 truncate">
+                                {f.meta?.spnDescription || f.description}
+                              </div>
+                              <div className="text-[11px] text-neutral-400">
+                                {f.meta?.sourceAddressName || ""}
+                              </div>
+                            </td>
                             <td className="px-2 py-1">
                               <Badge tone={sevTone(f.severity)}>
                                 {f.severity}
                               </Badge>
+                            </td>
+                            <td className="px-2 py-1">
+                              {f.meta?.milStatus === 1 ? "On" : "Off"}
                             </td>
                             <td className="px-2 py-1 whitespace-nowrap">
                               {f.time
                                 ? new Date(f.time).toLocaleTimeString()
                                 : "—"}
                             </td>
-                            <td className="px-2 py-1">
+                            <td className="px-2 py-1 space-x-1">
+                              {ack?.has(f.id) ? (
+                                <Badge tone="neutral">Ack</Badge>
+                              ) : (
+                                <button
+                                  className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+                                  onClick={() => onAck?.(f.id)}
+                                >
+                                  Ack
+                                </button>
+                              )}
                               <button
                                 className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
                                 onClick={() =>
@@ -1292,7 +1585,10 @@ function DetailsModal({
                                     vin,
                                     faultId: f.id,
                                     code: f.code,
-                                    note: "",
+                                    note:
+                                      f.meta?.spnDescription ||
+                                      f.description ||
+                                      "",
                                   })
                                 }
                               >
@@ -1311,7 +1607,7 @@ function DetailsModal({
                 <div className="mb-2 text-xs text-neutral-500 dark:text-neutral-400">
                   Fault history
                 </div>
-                <div className="max-h-40 overflow-auto pr-1">
+                <div className="max-h-48 overflow-auto pr-1">
                   {histFaults.length === 0 ? (
                     <div className="text-sm text-neutral-500">No history</div>
                   ) : (
@@ -1368,6 +1664,52 @@ function DetailsModal({
         </div>
       </div>
     </div>
+  );
+}
+
+// tiny SVG “trail” (last 25 points)
+function TrailMini({ trail = [] }) {
+  if (trail.length < 2)
+    return (
+      <div className="h-10 text-[11px] text-neutral-400 dark:text-neutral-500 flex items-center">
+        No movement trail
+      </div>
+    );
+  const W = 520,
+    H = 44,
+    pad = 6;
+  const lats = trail.map((p) => p.lat);
+  const lons = trail.map((p) => p.lon);
+  const minLat = Math.min(...lats),
+    maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons),
+    maxLon = Math.max(...lons);
+  const scaleX = (lon) =>
+    pad + ((lon - minLon) / Math.max(1e-6, maxLon - minLon)) * (W - pad * 2);
+  const scaleY = (lat) =>
+    pad +
+    (1 - (lat - minLat) / Math.max(1e-6, maxLat - minLat)) * (H - pad * 2);
+  const points = trail
+    .map((p) => `${scaleX(p.lon)},${scaleY(p.lat)}`)
+    .join(" ");
+  const last = trail[trail.length - 1];
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-11">
+      <polyline
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        points={points}
+        className="text-neutral-400 dark:text-neutral-500"
+      />
+      <circle
+        cx={scaleX(last.lon)}
+        cy={scaleY(last.lat)}
+        r="3"
+        className="text-neutral-700 dark:text-neutral-300"
+        fill="currentColor"
+      />
+    </svg>
   );
 }
 
@@ -1559,6 +1901,7 @@ function exportCsv(list) {
     "city",
     "state",
     "lastTopic",
+    "milOn",
   ];
   const header = cols.join(",");
   const rows = list.map((r) =>
@@ -1578,9 +1921,22 @@ function exportCsv(list) {
 function exportFaultsCsv(list) {
   const rows = [];
   rows.push(
-    ["vin", "id", "code", "severity", "active", "time", "city", "state"].join(
-      ","
-    )
+    [
+      "vin",
+      "id",
+      "code",
+      "severity",
+      "mil",
+      "active",
+      "time",
+      "spn",
+      "fmi",
+      "spnDescription",
+      "fmiDescription",
+      "source",
+      "city",
+      "state",
+    ].join(",")
   );
   for (const r of list) {
     for (const f of r.faults?.active || []) {
@@ -1589,12 +1945,20 @@ function exportFaultsCsv(list) {
         r.id || "",
         f.code || "",
         f.severity || "",
+        f.meta?.milStatus === 1 ? "1" : "0",
         String(!!f.active),
         f.time || "",
+        f.meta?.spn ?? "",
+        f.meta?.fmi ?? "",
+        f.meta?.spnDescription || "",
+        f.meta?.fmiDescription || "",
+        f.meta?.sourceAddressName || "",
         r.city || "",
         r.state || "",
       ].map((v) =>
-        /[",\n]/.test(v) ? `"${String(v).replace(/"/g, '""')}"` : v
+        /[",\n]/.test(String(v))
+          ? `"${String(v).replace(/"/g, '""')}"`
+          : String(v)
       );
       rows.push(vals.join(","));
     }

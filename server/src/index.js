@@ -5,58 +5,47 @@ import http from "http";
 import { Server as IOServer } from "socket.io";
 import { buildKafka } from "./kafka.js";
 
-// ---------------------------------------------------------------------------
-// Env
-// ---------------------------------------------------------------------------
+/** ---------- Env ---------- */
 const PORT = parseInt(process.env.PORT || "8080", 10);
 const topics = (process.env.TOPICS || "")
   .split(",")
   .map((t) => t.trim())
   .filter(Boolean);
-
 if (topics.length === 0) {
   console.error("No topics provided. Set TOPICS=topic1,topic2 in your .env");
   process.exit(1);
 }
-
-// groupId (support GROUP_ID or KAFKA_GROUP_ID)
 const groupId =
   process.env.KAFKA_GROUP_ID ||
   process.env.GROUP_ID ||
   `atsiai-realtime-${Math.random().toString(36).slice(2, 8)}`;
 
-// ---------------------------------------------------------------------------
-// HTTP + WS
-// ---------------------------------------------------------------------------
+/** ---------- HTTP + WS ---------- */
 const app = express();
 const server = http.createServer(app);
 const io = new IOServer(server, {
   cors: { origin: "*", methods: ["GET", "POST"] },
 });
-
 app.use(express.json());
 
-// In-memory state
-const latestById = new Map(); // id -> asset snapshot
-const helpRequests = []; // basic queue in memory
+const latestById = new Map(); // id -> asset snapshot (loc/speed/faults/etc.)
+const helpRequests = []; // in-memory
 
-// Helpers
 const NOW = () => Date.now();
 const safeJson = (buf) => {
   try {
     return typeof buf === "string"
       ? JSON.parse(buf)
-      : JSON.parse(buf.toString("utf8"));
+      : JSON.parse(buf?.toString("utf8") ?? "{}");
   } catch {
     return null;
   }
 };
-const pick = (o, k, d = undefined) => (o && k in o ? o[k] : d);
 
+/** ---------- Identity helpers ---------- */
 function extractIdentity(obj) {
-  const assetId = pick(obj, "asset.id") ?? obj?.asset?.id;
-  const vehId = pick(obj, "vehicle.id") ?? obj?.vehicle?.id;
-  const id = assetId ?? vehId;
+  if (!obj || typeof obj !== "object") return {};
+  const id = obj?.asset?.id ?? obj?.vehicle?.id ?? null;
   const vin =
     obj?.asset?.externalIds?.["samsara.vin"] ||
     obj?.vehicle?.externalIds?.["samsara.vin"];
@@ -66,24 +55,23 @@ function extractIdentity(obj) {
   return { id, vin, serial };
 }
 
+/** ---------- Normalize: location / speed ---------- */
 function normalizeLocation(obj, fallbackIso) {
-  // Try Samsara location payload
-  const identity = extractIdentity(obj);
-  let mph = undefined;
-
-  // speed can be mph directly or meters/s
+  const { id, vin, serial } = extractIdentity(obj);
+  let mph;
   if (obj?.ecuSpeedMph?.value != null) mph = Number(obj.ecuSpeedMph.value);
   if (obj?.speed?.ecuSpeedMetersPerSecond != null) {
     mph = Number(obj.speed.ecuSpeedMetersPerSecond) * 2.2369362920544;
   }
-
   const loc = obj?.location || {};
   const addr = loc?.address || {};
   const time =
     obj?.happenedAtTime || obj?.ecuSpeedMph?.time || obj?.time || fallbackIso;
 
   return {
-    ...identity,
+    id,
+    vin,
+    serial,
     time,
     lat: loc?.latitude,
     lon: loc?.longitude,
@@ -94,50 +82,67 @@ function normalizeLocation(obj, fallbackIso) {
   };
 }
 
-function normalizeFault(obj, fallbackIso) {
-  // we accept shapes like {asset:{id,...}} or {vehicle:{id,...}}
-  const identity = extractIdentity(obj);
+/** ---------- Normalize: J1939 SPN/FMI faults ---------- */
+function normalizeJ1939FaultItem(item, whenIso) {
+  // item sample fields: spnId, fmiId, spnDescription, fmiDescription, milStatus, sourceAddressName...
+  const spnId = item?.spnId;
+  const fmiId = item?.fmiId;
+  const code = [
+    spnId != null ? `SPN ${spnId}` : null,
+    fmiId != null ? `FMI ${fmiId}` : null,
+  ]
+    .filter(Boolean)
+    .join(" / ");
 
-  // Flexible fault fields:
-  const f = obj?.fault || obj?.dtc || obj?.code || obj?.event || {};
-  const code = f?.code ?? obj?.code ?? obj?.faultCode ?? "UNKNOWN";
-  const description =
-    f?.description ?? obj?.description ?? obj?.message ?? "No description";
-  const severity = (f?.severity || obj?.severity || "unknown")
-    .toString()
-    .toLowerCase();
-  const active =
-    typeof f?.active === "boolean"
-      ? f.active
-      : typeof obj?.active === "boolean"
-      ? obj.active
-      : true;
+  const description = [
+    item?.spnDescription || "",
+    item?.fmiDescription ? ` — ${item.fmiDescription}` : "",
+    item?.sourceAddressName ? ` (${item.sourceAddressName})` : "",
+  ]
+    .join("")
+    .trim();
 
-  const time = obj?.time || obj?.happenedAtTime || fallbackIso;
+  const severity = Number(item?.milStatus) === 1 ? "critical" : "warning";
 
   return {
-    ...identity,
-    fault: {
-      id: `${code}:${time}`, // unique-ish
-      code: String(code),
-      description: String(description),
-      severity, // "critical" | "warning" | "info" | "unknown"
-      active: Boolean(active),
-      time,
-    },
+    id: `${code || "UNKNOWN"}@${whenIso}`,
+    code: code || "UNKNOWN",
+    description: description || "Unknown fault",
+    severity,
+    active: true,
+    time: whenIso,
   };
 }
 
+function normalizeFaultPayload(obj, whenIso, kafkaKey) {
+  // identity first
+  let { id, vin, serial } = extractIdentity(obj);
+  if (!id) id = kafkaKey || null;
+
+  // find array of fault items
+  let list = [];
+  if (Array.isArray(obj)) list = obj;
+  else if (Array.isArray(obj?.faults)) list = obj.faults;
+  else if (Array.isArray(obj?.items)) list = obj.items;
+  else if (Array.isArray(obj?.j1939)) list = obj.j1939;
+  else if (obj?.spnId != null) list = [obj]; // single item
+
+  const faults = list
+    .map((it) => normalizeJ1939FaultItem(it, whenIso))
+    .filter(Boolean);
+  return { id, vin, serial, faults };
+}
+
+/** ---------- Upsert / Merge ---------- */
 function upsertAssetBase(record, topic) {
   const id = record.id || record.vin || record.serial;
   if (!id) return null;
 
   const prev = latestById.get(id) || {};
-  const base = {
+  const merged = {
     id,
     vin: record.vin ?? prev.vin,
     serial: record.serial ?? prev.serial,
-    // location fields
     time: record.time ?? prev.time,
     lat: record.lat ?? prev.lat,
     lon: record.lon ?? prev.lon,
@@ -145,32 +150,31 @@ function upsertAssetBase(record, topic) {
     city: record.city ?? prev.city,
     state: record.state ?? prev.state,
     mph: record.mph ?? prev.mph,
-    // faults container
-    faults: prev.faults || { active: [], history: [] },
+    faults: prev.faults || { active: [], history: [], counts: {} },
     lastTopic: topic,
     lastUpdateTs: NOW(),
   };
-  latestById.set(id, base);
-  return base;
+  latestById.set(id, merged);
+  return merged;
 }
 
 function handleFaultMerge(asset, faultObj) {
   if (!asset || !faultObj) return;
 
-  // history append
+  // history
   asset.faults.history.push(faultObj);
-  if (asset.faults.history.length > 200) asset.faults.history.shift();
+  if (asset.faults.history.length > 600) asset.faults.history.shift();
 
-  // active set update (dedupe by code)
+  // active: dedupe by code
   const idx = asset.faults.active.findIndex((f) => f.code === faultObj.code);
   if (faultObj.active) {
     if (idx === -1) asset.faults.active.push(faultObj);
     else asset.faults.active[idx] = faultObj;
-  } else {
-    if (idx !== -1) asset.faults.active.splice(idx, 1);
+  } else if (idx !== -1) {
+    asset.faults.active.splice(idx, 1);
   }
 
-  // severity counters
+  // counts
   const counters = { critical: 0, warning: 0, info: 0, unknown: 0 };
   for (const f of asset.faults.active) {
     const s = ["critical", "warning", "info"].includes(f.severity)
@@ -181,7 +185,7 @@ function handleFaultMerge(asset, faultObj) {
   asset.faults.counts = counters;
 }
 
-// routes
+/** ---------- Routes ---------- */
 app.get("/health", (_, res) =>
   res.json({ ok: true, topics, groupId, size: latestById.size })
 );
@@ -220,18 +224,18 @@ app.post("/help", (req, res) => {
   const reqObj = {
     id,
     vin,
-    faultId,
-    code,
+    faultId: faultId || null,
+    code: code || null,
     note: note || "",
     createdAt,
     status: "open",
   };
   helpRequests.push(reqObj);
-  io.emit("help", reqObj); // notify UIs
+  io.emit("help", reqObj);
   res.json({ ok: true, request: reqObj });
 });
 
-// Debug endpoint (still handy)
+// optional debug
 app.post("/debug/push", (req, res) => {
   const now = new Date().toISOString();
   const id = req.body?.id || `debug-${Date.now()}`;
@@ -252,7 +256,6 @@ app.post("/debug/push", (req, res) => {
   res.json({ ok: true, id: asset.id });
 });
 
-// sockets
 io.on("connection", (socket) => {
   console.log(`[socket] connected: ${socket.id} snapshot=${latestById.size}`);
   socket.emit("snapshot", Array.from(latestById.values()));
@@ -261,9 +264,7 @@ io.on("connection", (socket) => {
   );
 });
 
-// ---------------------------------------------------------------------------
-// Kafka
-// ---------------------------------------------------------------------------
+/** ---------- Kafka ---------- */
 const kafka = buildKafka();
 const consumer = kafka.consumer({ groupId });
 
@@ -275,55 +276,38 @@ async function run() {
 
   await consumer.run({
     eachMessage: async ({ topic, partition, message }) => {
-      const rawStr = message.value?.toString();
       const ts = message.timestamp
         ? new Date(Number(message.timestamp)).toISOString()
         : new Date().toISOString();
+      const key = message.key?.toString() || null;
+      const obj = safeJson(message.value?.toString()) ?? {};
 
-      // log (compact)
       console.log(
         JSON.stringify(
-          {
-            topic,
-            p: partition,
-            off: message.offset,
-            t: ts,
-            key: message.key?.toString(),
-          },
+          { topic, p: partition, off: message.offset, t: ts, key },
           null,
           0
         )
       );
 
-      const obj = safeJson(rawStr) || {};
-
-      if (topic.includes("fault")) {
-        // ---- faults pathway
-        const f = normalizeFault(obj, ts);
-        if (!f.id) return;
-        const asset = upsertAssetBase(f, topic);
-        const faultObj = {
-          id: f.fault.id,
-          code: f.fault.code,
-          description: f.fault.description,
-          severity: f.fault.severity,
-          active: f.fault.active,
-          time: f.fault.time,
-        };
-
-        handleFaultMerge(asset, faultObj);
+      if (topic.toLowerCase().includes("fault")) {
+        // ---- faults ----
+        const { id, vin, serial, faults } = normalizeFaultPayload(obj, ts, key);
+        if (!id || faults.length === 0) return;
+        const asset = upsertAssetBase({ id, vin, serial }, topic);
+        for (const f of faults) {
+          handleFaultMerge(asset, f);
+          io.emit("fault", {
+            ...f,
+            id: asset.id,
+            vin: asset.vin,
+            serial: asset.serial,
+          });
+        }
         latestById.set(asset.id, { ...asset, lastUpdateTs: NOW() });
-
-        // broadcast both the generic asset update and specific fault event
         io.emit("update", latestById.get(asset.id));
-        io.emit("fault", {
-          ...faultObj,
-          id: asset.id,
-          vin: asset.vin,
-          serial: asset.serial,
-        });
       } else {
-        // ---- location/speed pathway
+        // ---- location / speed ----
         const rec = normalizeLocation(obj, ts);
         if (!rec.id) return;
         const asset = upsertAssetBase(rec, topic);
@@ -333,12 +317,11 @@ async function run() {
     },
   });
 
-  server.listen(PORT, () => {
-    console.log(`HTTP+WS listening on http://localhost:${PORT}`);
-  });
+  server.listen(PORT, () =>
+    console.log(`HTTP+WS listening on http://localhost:${PORT}`)
+  );
 }
 
-// shutdown
 const shutdown = async (sig) => {
   console.log(`\n${sig} received; closing...`);
   try {
