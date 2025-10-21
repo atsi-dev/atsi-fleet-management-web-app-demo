@@ -7,6 +7,7 @@ const WS_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:8080";
 
 /* ---------- utilities ---------- */
 const NOW = () => Date.now();
+const num = (v) => (v == null ? NaN : Number(v));
 const MPH = (v) => (Number.isFinite(v) ? v : null);
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 const cx = (...a) => a.filter(Boolean).join(" ");
@@ -33,94 +34,27 @@ const sevTone = (s) =>
     ? "blue"
     : "neutral";
 
-// ——— Fault helpers (normalize Samsara-style SPN/FMI JSON into our UI model) ———
-function normalizeFaultItems(items = [], context = {}) {
-  // items: array like the sample { spnId, spnDescription, fmiId, fmiDescription, milStatus, ... }
-  // returns {active: [...], counts: {...}, history: [...] }
-  const active = [];
-  const nowIso = new Date().toISOString();
-
-  for (const it of items) {
-    const spn = it.spnId != null ? Number(it.spnId) : undefined;
-    const fmi = it.fmiId != null ? Number(it.fmiId) : undefined;
-    const code = [
-      spn != null ? `SPN ${spn}` : null,
-      fmi != null ? `FMI ${fmi}` : null,
-    ]
-      .filter(Boolean)
-      .join(" ");
-
-    const src = it.sourceAddressName || "Unknown Module";
-    const desc =
-      it.spnDescription || it.fmiDescription || "Diagnostic trouble code";
-
-    // Basic rule-of-thumb severity: MIL on + misfire = critical, MIL on otherwise = warning, else info.
-    const misfire =
-      /misfire/i.test(desc) || spn === 1322 || spn === 1327 || spn === 1328;
-    const severity =
-      misfire && it.milStatus === 1
-        ? "critical"
-        : it.milStatus === 1
-        ? "warning"
-        : "info";
-
-    active.push({
-      id: `${context.id || context.vin || "veh"}:${spn || "?"}:${
-        fmi || "?"
-      }:${src}`,
-      code,
-      description: `${desc} (${src})`,
-      severity,
-      time: nowIso,
-      active: true,
-      meta: {
-        spn,
-        fmi,
-        spnDescription: it.spnDescription,
-        fmiDescription: it.fmiDescription,
-        milStatus: it.milStatus,
-        occurrenceCount: it.occurrenceCount,
-        sourceAddressName: src,
-        txId: it.txId,
-      },
-    });
-  }
-
-  // counts
-  const counts = { critical: 0, warning: 0, info: 0, unknown: 0 };
-  for (const f of active) {
-    if (counts[f.severity] != null) counts[f.severity]++;
-    else counts.unknown++;
-  }
-
-  return { active, counts, history: [] };
-}
-
-// merge faults into an existing row.faults
-function mergeFaults(prev = {}, patch = {}) {
-  const active = [...(prev.active || [])];
-  const seen = new Set(active.map((f) => f.id));
-  for (const f of patch.active || []) {
-    if (!seen.has(f.id)) {
-      active.push(f);
-      seen.add(f.id);
-    } else {
-      // update existing (time, severity, description)
-      const i = active.findIndex((x) => x.id === f.id);
-      if (i >= 0) active[i] = { ...active[i], ...f };
-    }
-  }
-  // recompute counts
-  const counts = { critical: 0, warning: 0, info: 0, unknown: 0 };
-  for (const f of active) {
-    if (counts[f.severity] != null) counts[f.severity]++;
-    else counts.unknown++;
-  }
-  const history = [...(prev.history || []), ...(patch.history || [])].slice(
-    -500
-  );
-  return { active, counts, history };
-}
+/* ---------- SPN Knowledge Base (Feature #4) ---------- */
+const SPN_KB = {
+  1322: {
+    name: "Engine Misfire (Multiple Cylinders)",
+    likely: "Random/multiple misfire; fuel quality/air/ignition.",
+    impact: "Rough running, power loss, possible catalyst damage.",
+    action: "Check misfire counts, fuel/air, coils/plugs, compression.",
+  },
+  1327: {
+    name: "Engine Cylinder 5 Misfire Rate",
+    likely: "Coil/plug, injector, compression on cylinder 5.",
+    impact: "Vibration, MIL likely on.",
+    action: "Swap test coil/plug/injector; balance, compression/leakdown.",
+  },
+  1328: {
+    name: "Engine Cylinder 6 Misfire Rate",
+    likely: "Coil/plug, injector, compression on cylinder 6.",
+    impact: "Vibration and power loss under load.",
+    action: "Swap test parts, verify mechanical integrity.",
+  },
+};
 
 /* ---------- theme (Auto/Light/Dark) ---------- */
 function useTheme() {
@@ -150,7 +84,6 @@ export default function App() {
   const [themeMode, setThemeMode] = useTheme();
 
   const [rows, setRows] = useState(() => {
-    // Offline warm start
     try {
       const cached = JSON.parse(
         localStorage.getItem("lastSnapshotRows") || "[]"
@@ -201,12 +134,19 @@ export default function App() {
     () => localStorage.getItem("onlyFav") === "1"
   );
 
-  // NEW: acknowledge faults (local)
+  // Feature #2: fault ACKs with expiry (24h)
   const [ack, setAck] = useState(() => {
     try {
-      return new Set(JSON.parse(localStorage.getItem("ackFaultIds") || "[]"));
+      const raw = JSON.parse(localStorage.getItem("ackFaultIdsV2") || "[]");
+      // purge expired at load
+      const now = Date.now();
+      return new Map(
+        raw
+          .map((x) => [x.id, x.until])
+          .filter(([_, until]) => Number(until) > now)
+      );
     } catch {
-      return new Set();
+      return new Map();
     }
   });
 
@@ -215,7 +155,10 @@ export default function App() {
     Number(localStorage.getItem("snoozeUntil") || "0")
   );
 
-  // modal
+  // Feature #3: Faults Center modal
+  const [faultCenterOpen, setFaultCenterOpen] = useState(false);
+
+  // modal (asset details)
   const [active, setActive] = useState(null);
 
   // toast
@@ -232,33 +175,27 @@ export default function App() {
   }, []);
 
   // persist UI
-  useEffect(() => {
-    localStorage.setItem("quick", quick);
-  }, [quick]);
-  useEffect(() => {
-    localStorage.setItem("query", query);
-  }, [query]);
-  useEffect(() => {
-    localStorage.setItem("minMph", String(minMph));
-  }, [minMph]);
-  useEffect(() => {
-    localStorage.setItem("sortBy", sortBy);
-  }, [sortBy]);
-  useEffect(() => {
-    localStorage.setItem("dense", dense ? "1" : "0");
-  }, [dense]);
-  useEffect(() => {
-    localStorage.setItem("onlyFav", onlyFav ? "1" : "0");
-  }, [onlyFav]);
-  useEffect(() => {
-    localStorage.setItem("coordPrec", String(coordPrec));
-  }, [coordPrec]);
-  useEffect(() => {
-    localStorage.setItem("mapProvider", mapProvider);
-  }, [mapProvider]);
-  useEffect(() => {
-    localStorage.setItem("snoozeUntil", String(snoozeUntil));
-  }, [snoozeUntil]);
+  useEffect(() => localStorage.setItem("quick", quick), [quick]);
+  useEffect(() => localStorage.setItem("query", query), [query]);
+  useEffect(() => localStorage.setItem("minMph", String(minMph)), [minMph]);
+  useEffect(() => localStorage.setItem("sortBy", sortBy), [sortBy]);
+  useEffect(() => localStorage.setItem("dense", dense ? "1" : "0"), [dense]);
+  useEffect(
+    () => localStorage.setItem("onlyFav", onlyFav ? "1" : "0"),
+    [onlyFav]
+  );
+  useEffect(
+    () => localStorage.setItem("coordPrec", String(coordPrec)),
+    [coordPrec]
+  );
+  useEffect(
+    () => localStorage.setItem("mapProvider", mapProvider),
+    [mapProvider]
+  );
+  useEffect(
+    () => localStorage.setItem("snoozeUntil", String(snoozeUntil)),
+    [snoozeUntil]
+  );
   useEffect(() => {
     try {
       localStorage.setItem("favorites", JSON.stringify([...favorites]));
@@ -266,7 +203,10 @@ export default function App() {
   }, [favorites]);
   useEffect(() => {
     try {
-      localStorage.setItem("ackFaultIds", JSON.stringify([...ack]));
+      localStorage.setItem(
+        "ackFaultIdsV2",
+        JSON.stringify([...ack].map(([id, until]) => ({ id, until })))
+      );
     } catch {}
   }, [ack]);
 
@@ -314,7 +254,7 @@ export default function App() {
     window.location.hash = p.toString() || "";
   };
 
-  // socket
+  // ----- sockets (match your server: snapshot, update, fault, help) -----
   useEffect(() => {
     const socket = io(WS_URL, {
       transports: ["polling", "websocket"],
@@ -353,8 +293,6 @@ export default function App() {
       lastEventsRef.current = ev;
       setRows(m);
       setLastSnapshotCount(items.length);
-
-      // persist a compressed view (array for localStorage)
       try {
         localStorage.setItem(
           "lastSnapshotRows",
@@ -363,6 +301,7 @@ export default function App() {
       } catch {}
     });
 
+    // location/speed update
     socket.on("update", (item) => {
       const now = NOW();
       setRows((prev) => {
@@ -394,38 +333,63 @@ export default function App() {
       lastEventsRef.current = ev;
     });
 
-    // NEW: raw "fault" events from legacy topic (kept as-is)
+    // ---- faults (your server emits this per item) ----
+    // payload shape (from server):
+    // { id: assetId, vin, serial, code, description, severity, active, time }
     socket.on("fault", (payload) => {
-      // expect: {id/vin, code, description, severity}
-      const isCritical = (payload.severity || "").toLowerCase() === "critical";
-      const snoozed = Date.now() < snoozeUntil;
+      const key = payload.id || payload.vin;
+      if (!key) return;
 
       setRows((prev) => {
         const next = new Map(prev);
-        const key = payload.id || payload.vin;
-        if (!key) return prev;
         const row = next.get(key) || { id: key, vin: payload.vin };
+        const prevFaults = row.faults || {
+          active: [],
+          history: [],
+          counts: {},
+        };
+
+        // history (append)
+        const history = [...(prevFaults.history || []), payload].slice(-600);
+
+        // active: dedupe by code
+        const active = [...(prevFaults.active || [])];
+        const idx = active.findIndex((f) => f.code === payload.code);
+        if (payload.active) {
+          if (idx === -1) active.push(payload);
+          else
+            active[idx] = {
+              ...active[idx],
+              ...payload,
+              lastSeen: payload.time,
+            };
+        } else if (idx !== -1) {
+          active.splice(idx, 1);
+        }
+
+        // counts
+        const counts = { critical: 0, warning: 0, info: 0, unknown: 0 };
+        for (const f of active) {
+          const s = ["critical", "warning", "info"].includes(
+            (f.severity || "").toLowerCase()
+          )
+            ? f.severity.toLowerCase()
+            : "unknown";
+          counts[s]++;
+        }
+
         const merged = {
           ...row,
-          faults: mergeFaults(row.faults, {
-            active: [
-              {
-                id: `${key}:${payload.code}`,
-                code: payload.code,
-                description: payload.description || "Fault",
-                severity: payload.severity || "info",
-                time: payload.time || new Date().toISOString(),
-                active: true,
-              },
-            ],
-            history: [],
-          }),
+          faults: { active, history, counts },
           lastUpdateTs: Date.now(),
         };
         next.set(key, merged);
         return next;
       });
 
+      // optional alert on critical and not snoozed
+      const isCritical = (payload.severity || "").toLowerCase() === "critical";
+      const snoozed = Date.now() < snoozeUntil;
       if (isCritical && !snoozed) {
         try {
           beep();
@@ -437,55 +401,6 @@ export default function App() {
             new Notification(`Critical fault ${payload.code}`, {
               body: `${payload.vin || payload.id}: ${
                 payload.description || "Fault"
-              }`,
-            });
-          }
-        } catch {}
-      }
-    });
-
-    // NEW: support for the **new fault codes topic** you asked for
-    // Expect payload like: { id, vin, codes: [ {fmiDescription, fmiId, milStatus, occurrenceCount, sourceAddressName, spnDescription, spnId, txId}, ... ] }
-    socket.on("faultcodes", (payload) => {
-      const key = payload.id || payload.vin;
-      if (!key || !Array.isArray(payload.codes)) return;
-
-      const patch = normalizeFaultItems(payload.codes, {
-        id: key,
-        vin: payload.vin,
-      });
-
-      setRows((prev) => {
-        const next = new Map(prev);
-        const row = next.get(key) || { id: key, vin: payload.vin };
-        const merged = {
-          ...row,
-          faults: mergeFaults(row.faults, patch),
-          lastUpdateTs: Date.now(),
-          // quick flag if MIL is on for any of these
-          milOn: payload.codes.some((c) => c.milStatus === 1),
-        };
-        next.set(key, merged);
-        return next;
-      });
-
-      // optional alert on any newly critical faults
-      const anyCritical = (patch.active || []).some(
-        (f) => f.severity === "critical"
-      );
-      const snoozed = Date.now() < snoozeUntil;
-      if (anyCritical && !snoozed) {
-        try {
-          beep();
-          ensureNotifs();
-          if (
-            "Notification" in window &&
-            Notification.permission === "granted"
-          ) {
-            new Notification(`Critical diagnostic fault`, {
-              body: `${payload.vin || key}: ${
-                patch.active.find((f) => f.severity === "critical")?.code ||
-                "SPN/FMI"
               }`,
             });
           }
@@ -536,6 +451,34 @@ export default function App() {
     return Array.from(byVin.values());
   }, [all]);
 
+  // Feature #1 + #5: misfire detection + priority scoring
+  const isMisfire = (f) => {
+    const d = (f.description || "") + " " + (f.code || "");
+    return /misfire/i.test(d) || /SPN\s*(1322|1327|1328)/i.test(d);
+  };
+  const faultPriorityScore = (r) => {
+    // higher is worse (sort desc)
+    const now = Date.now();
+    let score = 0;
+    for (const f of r.faults?.active || []) {
+      const sev =
+        (f.severity || "").toLowerCase() === "critical"
+          ? 3
+          : (f.severity || "").toLowerCase() === "warning"
+          ? 2
+          : 1;
+      const recency = f.time
+        ? Math.max(0, 1 - (now - new Date(f.time).getTime()) / 3600000)
+        : 0; // 0..1 (within 1h)
+      const repeat = (r.faults?.history || []).filter(
+        (h) => h.code === f.code
+      ).length;
+      const mis = isMisfire(f) ? 1 : 0;
+      score += sev * 10 + recency * 5 + Math.min(5, repeat) + mis * 8;
+    }
+    return score;
+  };
+
   // filters
   const quickFilter = (r) => {
     const mph = MPH(r.mph);
@@ -543,6 +486,7 @@ export default function App() {
     const hasCritical = (r.faults?.active || []).some(
       (f) => f.severity === "critical"
     );
+    const hasMisfire = (r.faults?.active || []).some((f) => isMisfire(f));
     switch (quick) {
       case "moving":
         return mph != null && mph >= 1;
@@ -554,21 +498,27 @@ export default function App() {
         return hasFaults;
       case "critical":
         return hasCritical;
-      case "mil":
-        return !!r.milOn;
+      case "misfire":
+        return hasMisfire;
       default:
         return true;
     }
   };
 
+  // Feature #2: is a fault acked?
+  const isAcked = (faultId) =>
+    faultId ? Number(ack.get(faultId)) > Date.now() : false;
+
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     const min = Number.isFinite(Number(minMph)) ? Number(minMph) : null;
+
     return deduped.filter((r) => {
       if (!quickFilter(r)) return false;
       if (onlyFav && !favorites.has(r.id)) return false;
       if (min != null && r.mph != null && r.mph < min) return false;
       if (!q) return true;
+
       const hay = [
         r.id,
         r.vin,
@@ -576,20 +526,17 @@ export default function App() {
         r.city,
         r.state,
         r.lastTopic,
-        // search in faults: SPN/FMI, descriptions and source module
         ...(r.faults?.active || []).flatMap((f) => [
           f.code,
           f.description,
           f.severity,
-          f.meta?.spnDescription,
-          f.meta?.fmiDescription,
-          f.meta?.sourceAddressName,
         ]),
         r.lat != null && r.lon != null ? `${r.lat},${r.lon}` : "",
       ]
         .filter(Boolean)
         .join(" ")
         .toLowerCase();
+
       return hay.includes(q);
     });
   }, [deduped, query, minMph, quick, onlyFav, favorites]);
@@ -617,12 +564,16 @@ export default function App() {
             (b.faults?.active?.length || 0) - (a.faults?.active?.length || 0)
         );
         break;
+      case "priority": // Feature #1: sort by computed priority
+        arr.sort((a, b) => faultPriorityScore(b) - faultPriorityScore(a));
+        break;
       default:
         arr.sort((a, b) => (b.lastUpdateTs || 0) - (a.lastUpdateTs || 0));
     }
     return arr;
   }, [filtered, sortBy]);
 
+  // KPIs
   const total = deduped.length;
   const moving = deduped.filter((r) => (r.mph ?? 0) >= 1).length;
   const faultCount = deduped.reduce(
@@ -675,7 +626,7 @@ export default function App() {
               </div>
             </div>
 
-            {/* Theme */}
+            {/* Theme & status */}
             <div className="flex items-center gap-2">
               <div className="rounded-2xl border border-neutral-200 bg-white px-2 py-1 shadow-sm dark:bg-neutral-900 dark:text-neutral-200 dark:border-neutral-800">
                 {["auto", "light", "dark"].map((m) => (
@@ -720,7 +671,7 @@ export default function App() {
                 id="global-search"
                 value={query}
                 onChange={setQuery}
-                placeholder="Search — VIN, ID, city, SPN/FMI, source module…"
+                placeholder="Search — VIN, ID, city, fault code…"
                 className="min-w-[220px] md:min-w-[320px]"
               />
               <Input
@@ -738,6 +689,7 @@ export default function App() {
                 items={[
                   { value: "vin", label: "Sort: VIN (A→Z)" },
                   { value: "recent", label: "Sort: Recent" },
+                  { value: "priority", label: "Sort: Priority" }, // Feature #1
                   { value: "speed", label: "Sort: Speed" },
                   { value: "faults", label: "Sort: Fault count" },
                   { value: "id", label: "Sort: ID" },
@@ -764,6 +716,15 @@ export default function App() {
                 title="Snooze critical alerts for 5 minutes"
               >
                 Snooze 5m
+              </button>
+              {/* Feature #3: Faults Center */}
+              <button
+                type="button"
+                onClick={() => setFaultCenterOpen(true)}
+                className="rounded-2xl border border-neutral-200 bg-white px-3 py-2 text-sm text-neutral-700 shadow-sm transition hover:bg-neutral-50 dark:bg-neutral-900 dark:text-neutral-200 dark:border-neutral-800 dark:hover:bg-neutral-800"
+                title="Open Faults Center"
+              >
+                Faults Center
               </button>
             </div>
 
@@ -836,14 +797,12 @@ export default function App() {
                 mapProvider={mapProvider}
                 setMapProvider={setMapProvider}
                 onHelp={requestHelp}
-                ack={ack}
-                onAck={(faultId) =>
-                  setAck((prev) => {
-                    const next = new Set(prev);
-                    next.add(faultId);
-                    return next;
-                  })
-                }
+                isAcked={isAcked}
+                onAck={(faultId) => {
+                  if (!faultId) return;
+                  const until = Date.now() + 24 * 60 * 60 * 1000; // 24h
+                  setAck((prev) => new Map(prev).set(faultId, until));
+                }}
               />
             ))}
           </div>
@@ -861,7 +820,16 @@ export default function App() {
         </span>
       </footer>
 
-      {/* Modal */}
+      {/* Faults Center Modal (Feature #3) */}
+      {faultCenterOpen && (
+        <FaultsCenter
+          onClose={() => setFaultCenterOpen(false)}
+          items={deduped}
+          exportCsv={() => exportFaultsCsv(deduped)}
+        />
+      )}
+
+      {/* Details Modal */}
       {active && (
         <DetailsModal
           row={rows.get(active)}
@@ -872,14 +840,12 @@ export default function App() {
           coordPrec={coordPrec}
           mapProvider={mapProvider}
           onHelp={requestHelp}
-          onAck={(faultId) =>
-            setAck((prev) => {
-              const next = new Set(prev);
-              next.add(faultId);
-              return next;
-            })
-          }
-          ack={ack}
+          isAcked={isAcked}
+          onAck={(faultId) => {
+            if (!faultId) return;
+            const until = Date.now() + 24 * 60 * 60 * 1000;
+            setAck((prev) => new Map(prev).set(faultId, until));
+          }}
         />
       )}
 
@@ -1071,7 +1037,7 @@ function QuickFilters({ value, onChange }) {
       <Opt v="nogps" label="No GPS" />
       <Opt v="faults" label="Faulted" />
       <Opt v="critical" label="Critical" />
-      <Opt v="mil" label="MIL on" />
+      <Opt v="misfire" label="Misfires Only" /> {/* Feature #5 */}
     </div>
   );
 }
@@ -1090,7 +1056,7 @@ function AssetCard({
   mapProvider,
   setMapProvider,
   onHelp,
-  ack,
+  isAcked,
   onAck,
 }) {
   const {
@@ -1108,7 +1074,6 @@ function AssetCard({
     __hot,
     lastUpdateTs,
     faults,
-    milOn,
   } = row;
 
   const location = fmtLocation(city, state);
@@ -1164,7 +1129,6 @@ function AssetCard({
               label="Copy"
               onCopy={() => onCopy?.("VIN copied")}
             />
-            {milOn ? <Badge tone="amber">MIL</Badge> : null}
             <button
               className={cx(
                 "rounded-lg px-2 py-1 text-[11px] ring-1 transition",
@@ -1271,20 +1235,20 @@ function AssetCard({
                   key={f.id || f.code}
                   className="flex items-center gap-2 text-xs"
                 >
-                  <Badge tone={sevTone(f.severity)}>{f.code}</Badge>
+                  <Badge tone={sevTone((f.severity || "").toLowerCase())}>
+                    {f.code}
+                  </Badge>
                   <span className="truncate" title={f.description}>
                     {truncateMiddle(f.description, 48)}
                   </span>
-                  {f.meta?.milStatus === 1 ? (
-                    <Badge tone="amber">MIL</Badge>
-                  ) : null}
-                  {ack?.has(f.id) ? (
+                  {/* Feature #2: local ACK */}
+                  {isAcked?.(f.id) ? (
                     <Badge tone="neutral">Ack</Badge>
                   ) : (
                     <button
                       className="ml-auto rounded-md px-2 py-0.5 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
                       onClick={() => onAck?.(f.id)}
-                      title="Acknowledge (local)"
+                      title="Acknowledge (24h)"
                     >
                       Ack
                     </button>
@@ -1374,8 +1338,8 @@ function DetailsModal({
   coordPrec,
   mapProvider,
   onHelp,
+  isAcked,
   onAck,
-  ack,
 }) {
   if (!row) return null;
   const {
@@ -1402,7 +1366,7 @@ function DetailsModal({
   const active = faults?.active || [];
   const histFaults = faults?.history || [];
 
-  // path points from recent events (for the trail preview under map)
+  // path points from recent events (trail under map)
   const trail = (events || [])
     .filter((e) => e.lat != null && e.lon != null)
     .slice(-25)
@@ -1533,70 +1497,82 @@ function DetailsModal({
                         <tr>
                           <th className="text-left px-2 py-1">Code</th>
                           <th className="text-left px-2 py-1">Severity</th>
-                          <th className="text-left px-2 py-1">MIL</th>
                           <th className="text-left px-2 py-1">When</th>
+                          <th className="text-left px-2 py-1">KB</th>
                           <th className="text-left px-2 py-1">Actions</th>
                         </tr>
                       </thead>
                       <tbody>
-                        {active.map((f) => (
-                          <tr
-                            key={f.id}
-                            className="odd:bg-white even:bg-neutral-50 dark:odd:bg-neutral-900 dark:even:bg-neutral-800/60"
-                          >
-                            <td className="px-2 py-1">
-                              <div className="font-mono">{f.code}</div>
-                              <div className="text-xs text-neutral-500 truncate">
-                                {f.meta?.spnDescription || f.description}
-                              </div>
-                              <div className="text-[11px] text-neutral-400">
-                                {f.meta?.sourceAddressName || ""}
-                              </div>
-                            </td>
-                            <td className="px-2 py-1">
-                              <Badge tone={sevTone(f.severity)}>
-                                {f.severity}
-                              </Badge>
-                            </td>
-                            <td className="px-2 py-1">
-                              {f.meta?.milStatus === 1 ? "On" : "Off"}
-                            </td>
-                            <td className="px-2 py-1 whitespace-nowrap">
-                              {f.time
-                                ? new Date(f.time).toLocaleTimeString()
-                                : "—"}
-                            </td>
-                            <td className="px-2 py-1 space-x-1">
-                              {ack?.has(f.id) ? (
-                                <Badge tone="neutral">Ack</Badge>
-                              ) : (
+                        {active.map((f) => {
+                          const spn = (() => {
+                            const m = /SPN\s+(\d+)/i.exec(f.code || "");
+                            return m ? Number(m[1]) : undefined;
+                          })();
+                          return (
+                            <tr
+                              key={f.id}
+                              className="odd:bg-white even:bg-neutral-50 dark:odd:bg-neutral-900 dark:even:bg-neutral-800/60"
+                            >
+                              <td className="px-2 py-1">
+                                <div className="font-mono">{f.code}</div>
+                                <div className="text-xs text-neutral-500 truncate">
+                                  {f.description}
+                                </div>
+                              </td>
+                              <td className="px-2 py-1">
+                                <Badge
+                                  tone={sevTone(
+                                    (f.severity || "").toLowerCase()
+                                  )}
+                                >
+                                  {f.severity}
+                                </Badge>
+                              </td>
+                              <td className="px-2 py-1 whitespace-nowrap">
+                                {f.time
+                                  ? new Date(f.time).toLocaleTimeString()
+                                  : "—"}
+                              </td>
+                              <td className="px-2 py-1">
+                                {spn && SPN_KB[spn] ? (
+                                  <KbBtn spn={spn} />
+                                ) : (
+                                  <span className="text-neutral-400 text-xs">
+                                    —
+                                  </span>
+                                )}
+                              </td>
+                              <td className="px-2 py-1 space-x-1">
+                                {/* Ack */}
+                                {isAcked?.(f.id) ? (
+                                  <Badge tone="neutral">Ack</Badge>
+                                ) : (
+                                  <button
+                                    className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+                                    onClick={() => onAck?.(f.id)}
+                                  >
+                                    Ack
+                                  </button>
+                                )}
+                                {/* Help */}
                                 <button
                                   className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
-                                  onClick={() => onAck?.(f.id)}
+                                  onClick={() =>
+                                    onHelp?.({
+                                      id,
+                                      vin,
+                                      faultId: f.id,
+                                      code: f.code,
+                                      note: f.description || "",
+                                    })
+                                  }
                                 >
-                                  Ack
+                                  Help
                                 </button>
-                              )}
-                              <button
-                                className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
-                                onClick={() =>
-                                  onHelp?.({
-                                    id,
-                                    vin,
-                                    faultId: f.id,
-                                    code: f.code,
-                                    note:
-                                      f.meta?.spnDescription ||
-                                      f.description ||
-                                      "",
-                                  })
-                                }
-                              >
-                                Help
-                              </button>
-                            </td>
-                          </tr>
-                        ))}
+                              </td>
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   )}
@@ -1636,7 +1612,11 @@ function DetailsModal({
                               </td>
                               <td className="px-2 py-1 font-mono">{f.code}</td>
                               <td className="px-2 py-1">
-                                <Badge tone={sevTone(f.severity)}>
+                                <Badge
+                                  tone={sevTone(
+                                    (f.severity || "").toLowerCase()
+                                  )}
+                                >
                                   {f.severity}
                                 </Badge>
                               </td>
@@ -1663,6 +1643,40 @@ function DetailsModal({
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+// KB popover button
+function KbBtn({ spn }) {
+  const data = SPN_KB[spn];
+  const [open, setOpen] = useState(false);
+  if (!data) return null;
+  return (
+    <div className="relative inline-block">
+      <button
+        className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+        onClick={() => setOpen((v) => !v)}
+        title="Open knowledge base"
+      >
+        Guide
+      </button>
+      {open && (
+        <div className="absolute z-10 mt-1 w-64 rounded-xl border border-neutral-200 bg-white p-3 text-xs shadow-xl dark:bg-neutral-900 dark:border-neutral-700">
+          <div className="font-semibold mb-1">
+            SPN {spn}: {data.name}
+          </div>
+          <div className="mb-1">
+            <strong>Likely:</strong> {data.likely}
+          </div>
+          <div className="mb-1">
+            <strong>Impact:</strong> {data.impact}
+          </div>
+          <div>
+            <strong>Action:</strong> {data.action}
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1713,6 +1727,175 @@ function TrailMini({ trail = [] }) {
   );
 }
 
+function FaultsCenter({ onClose, items, exportCsv }) {
+  // Flatten all active faults
+  const faults = [];
+  for (const a of items) {
+    for (const f of a.faults?.active || []) {
+      faults.push({
+        assetId: a.id,
+        vin: a.vin,
+        city: a.city,
+        state: a.state,
+        code: f.code,
+        description: f.description,
+        severity: (f.severity || "").toLowerCase(),
+        time: f.time,
+      });
+    }
+  }
+  const [sev, setSev] = useState("all");
+  const filtered = faults.filter((f) =>
+    sev === "all" ? true : f.severity === sev
+  );
+  const topBySPN = topCounts(filtered.map((f) => f.code));
+  const topByVIN = topCounts(filtered.map((f) => f.vin || f.assetId));
+
+  return (
+    <div className="fixed inset-0 z-[75]">
+      <div className="absolute inset-0 bg-black/40" onClick={onClose} />
+      <div className="absolute left-1/2 top-1/2 w-[min(100vw-2rem,1100px)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-neutral-200 bg-white shadow-2xl dark:bg-neutral-900 dark:border-neutral-800 p-4">
+        <div className="flex items-center justify-between">
+          <div className="text-lg font-semibold">Faults Center</div>
+          <div className="flex items-center gap-2">
+            <select
+              value={sev}
+              onChange={(e) => setSev(e.target.value)}
+              className="rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm dark:bg-neutral-900 dark:border-neutral-800"
+              title="Filter by severity"
+            >
+              <option value="all">All severities</option>
+              <option value="critical">Critical</option>
+              <option value="warning">Warning</option>
+              <option value="info">Info</option>
+            </select>
+            <button
+              onClick={exportCsv}
+              className="rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm dark:bg-neutral-900 dark:border-neutral-800"
+              title="Export active faults CSV"
+            >
+              Export CSV ↧
+            </button>
+            <button
+              className="rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 dark:bg-neutral-900 dark:text-neutral-200 dark:border-neutral-700 dark:hover:bg-neutral-800"
+              onClick={onClose}
+            >
+              Close ✕
+            </button>
+          </div>
+        </div>
+
+        <div className="grid md:grid-cols-3 gap-3 mt-3">
+          <div className="rounded-xl ring-1 ring-neutral-200/70 bg-neutral-50 p-3 dark:bg-neutral-800 dark:ring-neutral-700">
+            <div className="text-xs text-neutral-500 mb-1">Top SPN/FMI</div>
+            {topBySPN.length === 0 ? (
+              <div className="text-sm text-neutral-500">No data</div>
+            ) : (
+              <ul className="text-sm space-y-1">
+                {topBySPN.map(([code, count]) => (
+                  <li key={code} className="flex justify-between">
+                    <span className="font-mono">
+                      {truncateMiddle(code, 22)}
+                    </span>
+                    <span className="tabular-nums">{count}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="rounded-xl ring-1 ring-neutral-200/70 bg-neutral-50 p-3 dark:bg-neutral-800 dark:ring-neutral-700">
+            <div className="text-xs text-neutral-500 mb-1">Top VIN/Asset</div>
+            {topByVIN.length === 0 ? (
+              <div className="text-sm text-neutral-500">No data</div>
+            ) : (
+              <ul className="text-sm space-y-1">
+                {topByVIN.map(([vin, count]) => (
+                  <li key={vin} className="flex justify-between">
+                    <span className="font-mono">{truncateMiddle(vin, 22)}</span>
+                    <span className="tabular-nums">{count}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="rounded-xl ring-1 ring-neutral-200/70 bg-neutral-50 p-3 dark:bg-neutral-800 dark:ring-neutral-700 md:col-span-1">
+            <div className="text-xs text-neutral-500 mb-1">Counts</div>
+            <div className="flex gap-2">
+              <Badge tone="red">
+                Critical{" "}
+                {filtered.filter((f) => f.severity === "critical").length}
+              </Badge>
+              <Badge tone="amber">
+                Warn {filtered.filter((f) => f.severity === "warning").length}
+              </Badge>
+              <Badge tone="blue">
+                Info {filtered.filter((f) => f.severity === "info").length}
+              </Badge>
+            </div>
+          </div>
+        </div>
+
+        <div className="mt-3 rounded-xl ring-1 ring-neutral-200/70 bg-neutral-50 p-0 dark:bg-neutral-800 dark:ring-neutral-700 overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-neutral-100 text-neutral-600 text-xs dark:bg-neutral-700/50 dark:text-neutral-300">
+              <tr>
+                <th className="text-left px-2 py-1">When</th>
+                <th className="text-left px-2 py-1">VIN</th>
+                <th className="text-left px-2 py-1">Code</th>
+                <th className="text-left px-2 py-1">Severity</th>
+                <th className="text-left px-2 py-1">Location</th>
+                <th className="text-left px-2 py-1">Desc</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.length === 0 ? (
+                <tr>
+                  <td colSpan="6" className="px-3 py-4 text-neutral-500">
+                    No faults
+                  </td>
+                </tr>
+              ) : (
+                filtered
+                  .slice()
+                  .sort((a, b) => new Date(b.time) - new Date(a.time))
+                  .map((f, i) => (
+                    <tr
+                      key={i}
+                      className="odd:bg-white even:bg-neutral-50 dark:odd:bg-neutral-900 dark:even:bg-neutral-800/60"
+                    >
+                      <td className="px-2 py-1 whitespace-nowrap">
+                        {f.time ? new Date(f.time).toLocaleString() : "—"}
+                      </td>
+                      <td className="px-2 py-1 font-mono">
+                        {truncateMiddle(f.vin || f.assetId, 22)}
+                      </td>
+                      <td className="px-2 py-1 font-mono">{f.code}</td>
+                      <td className="px-2 py-1">
+                        <Badge tone={sevTone(f.severity)}>{f.severity}</Badge>
+                      </td>
+                      <td className="px-2 py-1">
+                        {fmtLocation(f.city, f.state) || "—"}
+                      </td>
+                      <td className="px-2 py-1 truncate">{f.description}</td>
+                    </tr>
+                  ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function topCounts(arr = []) {
+  const m = new Map();
+  for (const v of arr) m.set(v, (m.get(v) || 0) + 1);
+  return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+}
+
 function Fact({ label, children }) {
   return (
     <div>
@@ -1739,8 +1922,6 @@ function Action({ label, onClick, disabled }) {
     </button>
   );
 }
-
-/* ----------------------- small components ----------------------- */
 
 function Field({ label, children }) {
   return (
@@ -1901,7 +2082,6 @@ function exportCsv(list) {
     "city",
     "state",
     "lastTopic",
-    "milOn",
   ];
   const header = cols.join(",");
   const rows = list.map((r) =>
@@ -1921,22 +2101,9 @@ function exportCsv(list) {
 function exportFaultsCsv(list) {
   const rows = [];
   rows.push(
-    [
-      "vin",
-      "id",
-      "code",
-      "severity",
-      "mil",
-      "active",
-      "time",
-      "spn",
-      "fmi",
-      "spnDescription",
-      "fmiDescription",
-      "source",
-      "city",
-      "state",
-    ].join(",")
+    ["vin", "id", "code", "severity", "active", "time", "city", "state"].join(
+      ","
+    )
   );
   for (const r of list) {
     for (const f of r.faults?.active || []) {
@@ -1945,14 +2112,8 @@ function exportFaultsCsv(list) {
         r.id || "",
         f.code || "",
         f.severity || "",
-        f.meta?.milStatus === 1 ? "1" : "0",
         String(!!f.active),
         f.time || "",
-        f.meta?.spn ?? "",
-        f.meta?.fmi ?? "",
-        f.meta?.spnDescription || "",
-        f.meta?.fmiDescription || "",
-        f.meta?.sourceAddressName || "",
         r.city || "",
         r.state || "",
       ].map((v) =>

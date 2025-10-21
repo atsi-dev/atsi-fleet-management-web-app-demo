@@ -24,14 +24,19 @@ const groupId =
 const app = express();
 const server = http.createServer(app);
 const io = new IOServer(server, {
-  cors: { origin: "*", methods: ["GET", "POST"] },
+  cors: {
+    origin: process.env.CORS_ORIGIN?.split(",").map((s) => s.trim()) || "*",
+    methods: ["GET", "POST"],
+  },
 });
-app.use(express.json());
+app.use(express.json({ limit: "2mb" }));
 
-const latestById = new Map(); // id -> asset snapshot (loc/speed/faults/etc.)
-const helpRequests = []; // in-memory
-
+/** ---------- State ---------- */
+const latestById = new Map(); // id -> asset snapshot
+const helpRequests = [];
+const partitionLastId = new Map(); // partition -> last seen id from location
 const NOW = () => Date.now();
+
 const safeJson = (buf) => {
   try {
     return typeof buf === "string"
@@ -40,6 +45,14 @@ const safeJson = (buf) => {
   } catch {
     return null;
   }
+};
+const pickHeader = (headers, ...names) => {
+  if (!headers) return undefined;
+  for (const n of names) {
+    const v = headers[n] || headers[n.toLowerCase()];
+    if (v) return v.toString();
+  }
+  return undefined;
 };
 
 /** ---------- Identity helpers ---------- */
@@ -52,6 +65,26 @@ function extractIdentity(obj) {
   const serial =
     obj?.asset?.externalIds?.["samsara.serial"] ||
     obj?.vehicle?.externalIds?.["samsara.serial"];
+  return { id, vin, serial };
+}
+
+function resolveIdentityFromObj(obj) {
+  if (!obj || typeof obj !== "object") return {};
+  const env = extractIdentity(obj);
+  let id = env.id ?? obj.id ?? obj.vehicleId ?? obj.assetId ?? null;
+  let vin =
+    env.vin ??
+    obj.vin ??
+    obj.VIN ??
+    obj?.vehicle?.vin ??
+    obj?.asset?.vin ??
+    null;
+  let serial =
+    env.serial ??
+    obj.serial ??
+    obj?.vehicle?.serial ??
+    obj?.asset?.serial ??
+    null;
   return { id, vin, serial };
 }
 
@@ -84,7 +117,6 @@ function normalizeLocation(obj, fallbackIso) {
 
 /** ---------- Normalize: J1939 SPN/FMI faults ---------- */
 function normalizeJ1939FaultItem(item, whenIso) {
-  // item sample fields: spnId, fmiId, spnDescription, fmiDescription, milStatus, sourceAddressName...
   const spnId = item?.spnId;
   const fmiId = item?.fmiId;
   const code = [
@@ -92,45 +124,80 @@ function normalizeJ1939FaultItem(item, whenIso) {
     fmiId != null ? `FMI ${fmiId}` : null,
   ]
     .filter(Boolean)
-    .join(" / ");
+    .join(" ");
 
-  const description = [
+  const src = item?.sourceAddressName;
+  const descBits = [
     item?.spnDescription || "",
     item?.fmiDescription ? ` — ${item.fmiDescription}` : "",
-    item?.sourceAddressName ? ` (${item.sourceAddressName})` : "",
-  ]
-    .join("")
-    .trim();
+    src ? ` (${src})` : "",
+  ];
+  const description = descBits.join("").trim();
 
-  const severity = Number(item?.milStatus) === 1 ? "critical" : "warning";
+  const misfire =
+    /misfire/i.test(item?.spnDescription || "") ||
+    [1322, 1327, 1328].includes(Number(spnId));
+  let severity = "info";
+  if (Number(item?.milStatus) === 1) severity = "warning";
+  if (Number(item?.milStatus) === 1 && misfire) severity = "critical";
 
   return {
     id: `${code || "UNKNOWN"}@${whenIso}`,
     code: code || "UNKNOWN",
-    description: description || "Unknown fault",
+    description: description || "Diagnostic fault",
     severity,
     active: true,
     time: whenIso,
+    meta: {
+      spn: spnId ?? null,
+      fmi: fmiId ?? null,
+      spnDescription: item?.spnDescription,
+      fmiDescription: item?.fmiDescription,
+      milStatus: item?.milStatus,
+      occurrenceCount: item?.occurrenceCount,
+      sourceAddressName: src,
+      txId: item?.txId,
+    },
   };
 }
 
-function normalizeFaultPayload(obj, whenIso, kafkaKey) {
-  // identity first
-  let { id, vin, serial } = extractIdentity(obj);
-  if (!id) id = kafkaKey || null;
+function deepFindSpnArray(root, maxDepth = 5) {
+  if (!root || typeof root !== "object" || maxDepth < 0) return null;
+  if (Array.isArray(root)) {
+    if (
+      root.length > 0 &&
+      typeof root[0] === "object" &&
+      (root[0].spnId != null || root[0].fmiId != null)
+    ) {
+      return root;
+    }
+  }
+  for (const k of Object.keys(root)) {
+    const v = root[k];
+    if (!v) continue;
+    if (Array.isArray(v)) {
+      const arr = deepFindSpnArray(v, maxDepth - 1);
+      if (arr) return arr;
+    } else if (typeof v === "object") {
+      const arr = deepFindSpnArray(v, maxDepth - 1);
+      if (arr) return arr;
+    }
+  }
+  return null;
+}
 
-  // find array of fault items
+function normalizeFaultPayload(body, whenIso) {
   let list = [];
-  if (Array.isArray(obj)) list = obj;
-  else if (Array.isArray(obj?.faults)) list = obj.faults;
-  else if (Array.isArray(obj?.items)) list = obj.items;
-  else if (Array.isArray(obj?.j1939)) list = obj.j1939;
-  else if (obj?.spnId != null) list = [obj]; // single item
-
-  const faults = list
-    .map((it) => normalizeJ1939FaultItem(it, whenIso))
-    .filter(Boolean);
-  return { id, vin, serial, faults };
+  if (Array.isArray(body)) list = body;
+  else if (Array.isArray(body?.faults)) list = body.faults;
+  else if (Array.isArray(body?.items)) list = body.items;
+  else if (Array.isArray(body?.j1939)) list = body.j1939;
+  else if (body && (body.spnId != null || body.fmiId != null)) list = [body];
+  else {
+    const found = deepFindSpnArray(body);
+    if (found) list = found;
+  }
+  return list.map((it) => normalizeJ1939FaultItem(it, whenIso)).filter(Boolean);
 }
 
 /** ---------- Upsert / Merge ---------- */
@@ -161,11 +228,9 @@ function upsertAssetBase(record, topic) {
 function handleFaultMerge(asset, faultObj) {
   if (!asset || !faultObj) return;
 
-  // history
   asset.faults.history.push(faultObj);
   if (asset.faults.history.length > 600) asset.faults.history.shift();
 
-  // active: dedupe by code
   const idx = asset.faults.active.findIndex((f) => f.code === faultObj.code);
   if (faultObj.active) {
     if (idx === -1) asset.faults.active.push(faultObj);
@@ -174,7 +239,6 @@ function handleFaultMerge(asset, faultObj) {
     asset.faults.active.splice(idx, 1);
   }
 
-  // counts
   const counters = { critical: 0, warning: 0, info: 0, unknown: 0 };
   for (const f of asset.faults.active) {
     const s = ["critical", "warning", "info"].includes(f.severity)
@@ -183,6 +247,7 @@ function handleFaultMerge(asset, faultObj) {
     counters[s]++;
   }
   asset.faults.counts = counters;
+  asset.milOn = asset.faults.active.some((f) => f.meta?.milStatus === 1);
 }
 
 /** ---------- Routes ---------- */
@@ -235,7 +300,7 @@ app.post("/help", (req, res) => {
   res.json({ ok: true, request: reqObj });
 });
 
-// optional debug
+/** ---------- Debug injectors (for testing) ---------- */
 app.post("/debug/push", (req, res) => {
   const now = new Date().toISOString();
   const id = req.body?.id || `debug-${Date.now()}`;
@@ -256,12 +321,60 @@ app.post("/debug/push", (req, res) => {
   res.json({ ok: true, id: asset.id });
 });
 
-io.on("connection", (socket) => {
-  console.log(`[socket] connected: ${socket.id} snapshot=${latestById.size}`);
-  socket.emit("snapshot", Array.from(latestById.values()));
-  socket.on("disconnect", (reason) =>
-    console.log(`[socket] disconnected: ${reason}`)
-  );
+app.post("/debug/fault", (req, res) => {
+  const now = new Date().toISOString();
+  const id = req.body?.id || req.body?.vin || "1FUJHHDR9MLMJ5268";
+  const vin = req.body?.vin || id;
+  const payload = {
+    id,
+    vin,
+    code: req.body?.code || "SPN 1327 FMI 11",
+    description:
+      req.body?.description || "Engine Cylinder 5 Misfire Rate (Engine #1)",
+    severity: req.body?.severity || "critical",
+    active: true,
+    time: now,
+  };
+
+  const base = latestById.get(id) || { id, vin, time: now };
+  const asset = upsertAssetBase(base, "debug");
+  handleFaultMerge(asset, payload);
+  latestById.set(id, { ...asset, lastUpdateTs: NOW() });
+
+  io.emit("fault", { ...payload, id, vin });
+  io.emit("update", latestById.get(id));
+  res.json({ ok: true, injected: payload });
+});
+
+app.post("/debug/faultcodes", (req, res) => {
+  const now = new Date().toISOString();
+  const id = req.body?.id || req.body?.vin || "1FUJHHDR9MLMJ5268";
+  const vin = req.body?.vin || id;
+  const codes = Array.isArray(req.body?.codes)
+    ? req.body.codes
+    : [
+        {
+          fmiDescription: "Other Failure Mode",
+          fmiId: 11,
+          milStatus: 1,
+          occurrenceCount: 1,
+          sourceAddressName: "Engine #1",
+          spnDescription: "Engine Cylinder 5 Misfire Rate",
+          spnId: 1327,
+          txId: 0,
+        },
+      ];
+
+  const items = normalizeFaultPayload(codes, now);
+  const base = latestById.get(id) || { id, vin, time: now };
+  const asset = upsertAssetBase(base, "debug");
+  for (const f of items) handleFaultMerge(asset, f);
+  latestById.set(id, { ...asset, lastUpdateTs: NOW() });
+
+  io.emit("faultcodes", { id, vin, codes });
+  for (const f of items) io.emit("fault", { ...f, id, vin });
+  io.emit("update", latestById.get(id));
+  res.json({ ok: true, injected: { id, vin, count: items.length } });
 });
 
 /** ---------- Kafka ---------- */
@@ -279,39 +392,99 @@ async function run() {
       const ts = message.timestamp
         ? new Date(Number(message.timestamp)).toISOString()
         : new Date().toISOString();
-      const key = message.key?.toString() || null;
+      const keyStr = message.key?.toString() || null;
+      const headers = message.headers || {};
+      const hdrVin = pickHeader(headers, "vin", "VIN");
+      const hdrId = pickHeader(headers, "id", "vehicleId", "assetId");
       const obj = safeJson(message.value?.toString()) ?? {};
 
       console.log(
         JSON.stringify(
-          { topic, p: partition, off: message.offset, t: ts, key },
+          {
+            topic,
+            partition,
+            offset: message.offset,
+            ts,
+            key: keyStr,
+            hdrVin,
+            hdrId,
+            valueShape: Array.isArray(obj)
+              ? "array"
+              : obj && typeof obj === "object"
+              ? "object"
+              : typeof obj,
+          },
           null,
           0
         )
       );
 
       if (topic.toLowerCase().includes("fault")) {
-        // ---- faults ----
-        const { id, vin, serial, faults } = normalizeFaultPayload(obj, ts, key);
-        if (!id || faults.length === 0) return;
-        const asset = upsertAssetBase({ id, vin, serial }, topic);
-        for (const f of faults) {
-          handleFaultMerge(asset, f);
+        const codes = normalizeFaultPayload(obj, ts);
+
+        let { id, vin, serial } = resolveIdentityFromObj(obj);
+        if (!id)
+          id =
+            keyStr || hdrId || hdrVin || partitionLastId.get(partition) || null;
+        if (!vin) vin = hdrVin || id || null;
+
+        if (!id) {
+          if (latestById.size === 1) {
+            id = Array.from(latestById.keys())[0];
+            vin = vin || latestById.get(id)?.vin || id;
+          }
+        }
+
+        if (!id || codes.length === 0) {
+          console.warn(
+            "[faults] dropped message",
+            JSON.stringify({
+              reason: !id ? "missing id/vin" : "no codes found",
+              partition,
+              key: keyStr,
+              hdrVin,
+              hdrId,
+              objKeys:
+                obj && typeof obj === "object" ? Object.keys(obj) : typeof obj,
+            })
+          );
+          return;
+        }
+
+        const base = upsertAssetBase({ id, vin, serial }, topic);
+        for (const f of codes) {
+          handleFaultMerge(base, f);
           io.emit("fault", {
             ...f,
-            id: asset.id,
-            vin: asset.vin,
-            serial: asset.serial,
+            id: base.id,
+            vin: base.vin,
+            serial: base.serial,
           });
         }
-        latestById.set(asset.id, { ...asset, lastUpdateTs: NOW() });
-        io.emit("update", latestById.get(asset.id));
+        latestById.set(base.id, { ...base, lastUpdateTs: NOW() });
+
+        // send normalized batch to client (with raw SPN/FMI fields)
+        const rawForUi = codes.map((f) => ({
+          spnId: f.meta?.spn ?? null,
+          fmiId: f.meta?.fmi ?? null,
+          spnDescription: f.meta?.spnDescription,
+          fmiDescription: f.meta?.fmiDescription,
+          milStatus: f.meta?.milStatus,
+          occurrenceCount: f.meta?.occurrenceCount,
+          sourceAddressName: f.meta?.sourceAddressName,
+          txId: f.meta?.txId,
+        }));
+        io.emit("faultcodes", { id: base.id, vin: base.vin, codes: rawForUi });
+
+        io.emit("update", latestById.get(base.id));
       } else {
-        // ---- location / speed ----
         const rec = normalizeLocation(obj, ts);
         if (!rec.id) return;
         const asset = upsertAssetBase(rec, topic);
         latestById.set(asset.id, { ...asset, lastUpdateTs: NOW() });
+
+        partitionLastId.set(partition, asset.id);
+
         io.emit("update", latestById.get(asset.id));
       }
     },
