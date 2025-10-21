@@ -1,0 +1,35 @@
+{
+  "name": "atsiai-realtime-server",
+  "version": "1.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Real-time fleet telematics bridge between AWS MSK (Kafka) and a React Socket.IO dashboard for atsi.ai",
+  "scripts": {
+    "dev": "node src/index.js",
+    "start": "NODE_ENV=production node src/index.js"
+  },
+  "dependencies": {
+    "@aws-sdk/credential-providers": "^3.654.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "kafkajs": "^2.2.4",
+    "socket.io": "^4.7.5",
+    "zod": "^3.23.8"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "aws",
+    "msk",
+    "kafka",
+    "samsara",
+    "telematics",
+    "socket.io",
+    "real-time",
+    "fleet",
+    "atsiai"
+  ],
+  "author": "Ivan Mitkovski (atsi.ai)",
+  "license": "MIT"
+}
