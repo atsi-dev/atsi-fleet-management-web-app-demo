@@ -101,6 +101,7 @@ export default function App() {
   // histories & events
   const historyRef = useRef(new Map()); // id -> mph[]
   const lastEventsRef = useRef(new Map()); // id -> [{time, mph, lat, lon}]
+  const lastPointRef = useRef(new Map()); // id -> {t, lat, lon} (for interpolation)
 
   // UI state (persisted)
   const [quick, setQuick] = useState(
@@ -138,7 +139,6 @@ export default function App() {
   const [ack, setAck] = useState(() => {
     try {
       const raw = JSON.parse(localStorage.getItem("ackFaultIdsV2") || "[]");
-      // purge expired at load
       const now = Date.now();
       return new Map(
         raw
@@ -150,6 +150,30 @@ export default function App() {
     }
   });
 
+  // NEW — Fault notes (persisted local)
+  const [faultNotes, setFaultNotes] = useState(() => {
+    try {
+      return new Map(
+        (JSON.parse(localStorage.getItem("faultNotesV1") || "[]") || []).map(
+          (x) => [x.id, x.note]
+        )
+      );
+    } catch {
+      return new Map();
+    }
+  });
+
+  // NEW — Fault watchlist (SPN/FMI substrings)
+  const [watchlist, setWatchlist] = useState(() => {
+    try {
+      return new Set(
+        JSON.parse(localStorage.getItem("faultWatchlistV1") || "[]")
+      );
+    } catch {
+      return new Set(["SPN 1322", "SPN 1327", "SPN 1328"]);
+    }
+  });
+
   // faults: alerting + snooze
   const [snoozeUntil, setSnoozeUntil] = useState(() =>
     Number(localStorage.getItem("snoozeUntil") || "0")
@@ -158,8 +182,22 @@ export default function App() {
   // Feature #3: Faults Center modal
   const [faultCenterOpen, setFaultCenterOpen] = useState(false);
 
+  // NEW FEATURE #3 — AI Shops modal
+  const [shopModal, setShopModal] = useState({
+    open: false,
+    loading: false,
+    results: [],
+    q: null,
+    err: null,
+  });
+
   // modal (asset details)
   const [active, setActive] = useState(null);
+
+  // layout: list / map
+  const [showMap, setShowMap] = useState(
+    () => localStorage.getItem("showMap") === "1"
+  );
 
   // toast
   const [toast, setToast] = useState(null);
@@ -209,6 +247,22 @@ export default function App() {
       );
     } catch {}
   }, [ack]);
+  useEffect(() => {
+    try {
+      localStorage.setItem(
+        "faultNotesV1",
+        JSON.stringify([...faultNotes].map(([id, note]) => ({ id, note })))
+      );
+    } catch {}
+  }, [faultNotes]);
+  useEffect(() => {
+    try {
+      localStorage.setItem("faultWatchlistV1", JSON.stringify([...watchlist]));
+    } catch {}
+  }, [watchlist]);
+  useEffect(() => {
+    localStorage.setItem("showMap", showMap ? "1" : "0");
+  }, [showMap]);
 
   // notifications permission (optional)
   const ensureNotifs = () => {
@@ -281,13 +335,21 @@ export default function App() {
           if (arr.length > 60) arr.shift();
         }
         if (!ev.has(it.id)) ev.set(it.id, []);
-        ev.get(it.id).push({
+        const point = {
           time: it.time || new Date().toISOString(),
           mph: mph ?? null,
           lat: it.lat ?? null,
           lon: it.lon ?? null,
-        });
+        };
+        ev.get(it.id).push(point);
         if (ev.get(it.id).length > 25) ev.get(it.id).shift();
+        if (point.lat != null && point.lon != null) {
+          lastPointRef.current.set(it.id, {
+            t: new Date(point.time).getTime(),
+            lat: point.lat,
+            lon: point.lon,
+          });
+        }
       }
       historyRef.current = hist;
       lastEventsRef.current = ev;
@@ -323,14 +385,23 @@ export default function App() {
 
       const ev = new Map(lastEventsRef.current);
       if (!ev.has(item.id)) ev.set(item.id, []);
-      ev.get(item.id).push({
+      const point = {
         time: item.time || new Date().toISOString(),
         mph: mph ?? null,
         lat: item.lat ?? null,
         lon: item.lon ?? null,
-      });
+      };
+      ev.get(item.id).push(point);
       if (ev.get(item.id).length > 25) ev.get(item.id).shift();
       lastEventsRef.current = ev;
+
+      if (point.lat != null && point.lon != null) {
+        lastPointRef.current.set(item.id, {
+          t: new Date(point.time).getTime(),
+          lat: point.lat,
+          lon: point.lon,
+        });
+      }
     });
 
     // ---- faults (your server emits this per item) ----
@@ -425,6 +496,8 @@ export default function App() {
         document.getElementById("global-search")?.focus();
       } else if (e.key.toLowerCase() === "f") {
         setOnlyFav((v) => !v);
+      } else if (e.key === "m") {
+        setShowMap((v) => !v);
       } else if (e.key === "Escape") {
         if (active) closeDetails();
       }
@@ -456,6 +529,14 @@ export default function App() {
     const d = (f.description || "") + " " + (f.code || "");
     return /misfire/i.test(d) || /SPN\s*(1322|1327|1328)/i.test(d);
   };
+
+  // NEW — escalated critical if > 15 min
+  const isEscalated = (f) => {
+    if ((f.severity || "").toLowerCase() !== "critical") return false;
+    const t = f.time ? new Date(f.time).getTime() : 0;
+    return NOW() - t > 15 * 60 * 1000;
+  };
+
   const faultPriorityScore = (r) => {
     // higher is worse (sort desc)
     const now = Date.now();
@@ -474,7 +555,9 @@ export default function App() {
         (h) => h.code === f.code
       ).length;
       const mis = isMisfire(f) ? 1 : 0;
-      score += sev * 10 + recency * 5 + Math.min(5, repeat) + mis * 8;
+      const esc = isEscalated(f) ? 1 : 0;
+      score +=
+        sev * 10 + recency * 5 + Math.min(5, repeat) + mis * 8 + esc * 12;
     }
     return score;
   };
@@ -564,7 +647,7 @@ export default function App() {
             (b.faults?.active?.length || 0) - (a.faults?.active?.length || 0)
         );
         break;
-      case "priority": // Feature #1: sort by computed priority
+      case "priority":
         arr.sort((a, b) => faultPriorityScore(b) - faultPriorityScore(a));
         break;
       default:
@@ -689,7 +772,7 @@ export default function App() {
                 items={[
                   { value: "vin", label: "Sort: VIN (A→Z)" },
                   { value: "recent", label: "Sort: Recent" },
-                  { value: "priority", label: "Sort: Priority" }, // Feature #1
+                  { value: "priority", label: "Sort: Priority" },
                   { value: "speed", label: "Sort: Speed" },
                   { value: "faults", label: "Sort: Fault count" },
                   { value: "id", label: "Sort: ID" },
@@ -729,6 +812,19 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowMap((v) => !v)}
+                className={cx(
+                  "inline-flex items-center gap-2 rounded-2xl border px-3 py-2 text-sm shadow-sm transition",
+                  showMap
+                    ? "bg-emerald-500/95 text-white border-emerald-500 hover:bg-emerald-500"
+                    : "bg-white text-neutral-700 border-neutral-200 hover:bg-neutral-50 dark:bg-neutral-900 dark:text-neutral-200 dark:border-neutral-800 dark:hover:bg-neutral-800"
+                )}
+                title="Toggle live map (m)"
+              >
+                Live Map {showMap ? "On" : "Off"}
+              </button>
               <FaultCounters faults={faultCount} critical={criticalCount} />
               <button
                 type="button"
@@ -768,7 +864,14 @@ export default function App() {
 
       {/* Main */}
       <main className="mx-auto max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-        {list.length === 0 ? (
+        {showMap ? (
+          <LiveFleetMap
+            items={deduped}
+            trailsRef={lastEventsRef}
+            lastPointRef={lastPointRef}
+            onPick={(id) => openDetails(id)}
+          />
+        ) : list.length === 0 ? (
           <EmptyState
             connected={connected}
             ws={WS_URL}
@@ -803,6 +906,10 @@ export default function App() {
                   const until = Date.now() + 24 * 60 * 60 * 1000; // 24h
                   setAck((prev) => new Map(prev).set(faultId, until));
                 }}
+                faultNotes={faultNotes}
+                setFaultNotes={setFaultNotes}
+                watchlist={watchlist}
+                onFindShops={(v) => openShopSearch(v)}
               />
             ))}
           </div>
@@ -826,6 +933,9 @@ export default function App() {
           onClose={() => setFaultCenterOpen(false)}
           items={deduped}
           exportCsv={() => exportFaultsCsv(deduped)}
+          watchlist={watchlist}
+          setWatchlist={setWatchlist}
+          onFindShops={(v) => openShopSearch(v)}
         />
       )}
 
@@ -846,6 +956,26 @@ export default function App() {
             const until = Date.now() + 24 * 60 * 60 * 1000;
             setAck((prev) => new Map(prev).set(faultId, until));
           }}
+          faultNotes={faultNotes}
+          setFaultNotes={setFaultNotes}
+          onFindShops={(v) => openShopSearch(v)}
+          isEscalated={isEscalated}
+        />
+      )}
+
+      {/* Shop Finder Modal */}
+      {shopModal.open && (
+        <ShopFinderModal
+          state={shopModal}
+          onClose={() =>
+            setShopModal({
+              open: false,
+              loading: false,
+              results: [],
+              q: null,
+              err: null,
+            })
+          }
         />
       )}
 
@@ -879,6 +1009,39 @@ export default function App() {
     } catch (e) {
       fireToast(`Help failed: ${e.message}`);
     }
+  }
+
+  // NEW — open AI shop finder
+  function openShopSearch({ id, vin, lat, lon, faults = [] }) {
+    const activeCodes = (faults || []).map((f) => f.code).filter(Boolean);
+    const q = { id, vin, lat, lon, codes: activeCodes };
+    setShopModal({ open: true, loading: true, results: [], q, err: null });
+
+    (async () => {
+      try {
+        const res = await fetch(
+          `${WS_URL.replace("ws://", "http://")}/ai/shops`,
+          {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify(q),
+          }
+        );
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        setShopModal((s) => ({
+          ...s,
+          loading: false,
+          results: Array.isArray(json?.shops) ? json.shops : [],
+        }));
+      } catch (e) {
+        setShopModal((s) => ({
+          ...s,
+          loading: false,
+          err: e.message || "Failed to find shops",
+        }));
+      }
+    })();
   }
 }
 
@@ -1037,7 +1200,7 @@ function QuickFilters({ value, onChange }) {
       <Opt v="nogps" label="No GPS" />
       <Opt v="faults" label="Faulted" />
       <Opt v="critical" label="Critical" />
-      <Opt v="misfire" label="Misfires Only" /> {/* Feature #5 */}
+      <Opt v="misfire" label="Misfires Only" />
     </div>
   );
 }
@@ -1058,6 +1221,10 @@ function AssetCard({
   onHelp,
   isAcked,
   onAck,
+  faultNotes,
+  setFaultNotes,
+  watchlist,
+  onFindShops,
 }) {
   const {
     id,
@@ -1105,14 +1272,24 @@ function AssetCard({
         )})`;
   };
 
+  // watchlist hit?
+  const wlHit = activeFaults.some((f) =>
+    [...(watchlist || [])].some((w) =>
+      (f.code || f.description || "")
+        .toLowerCase()
+        .includes(String(w).toLowerCase())
+    )
+  );
+
   return (
     <article
       className={cx(
         "group relative rounded-2xl border overflow-hidden",
         "border-neutral-200 bg-white dark:bg-neutral-900 dark:border-neutral-800",
         isHot ? "ring-2 ring-emerald-400/70" : "ring-0",
-        "shadow-[0_1px_0_0_rgba(0,0,0,0.02),0_10px_30px_-12px_rgba(0,0,0,0.15)]",
-        "transition duration-200 hover:shadow-[0_1px_0_0_rgba(0,0,0,0.02),0_20px_50px_-16px_rgba(0,0,0,0.25)]",
+        wlHit ? "outline outline-2 outline-yellow-400/70" : "",
+        "shadow-[0_1px_0_0_rgba(0,0,0,0.02),0,10px,30px,-12px,rgba(0,0,0,0.15)]",
+        "transition duration-200 hover:shadow-[0_1px_0_0_rgba(0,0,0,0.02),0,20px,50px,-16px,rgba(0,0,0,0.25)]",
         dense ? "p-3" : "p-4",
         "flex flex-col min-h-[300px]"
       )}
@@ -1183,6 +1360,7 @@ function AssetCard({
         )}
         {counts.info > 0 && <Badge tone="blue">Info {counts.info}</Badge>}
         {activeFaults.length === 0 && <Badge tone="emerald">Healthy</Badge>}
+        {wlHit && <Badge tone="amber">Watchlist</Badge>}
       </div>
 
       {/* Body */}
@@ -1241,7 +1419,16 @@ function AssetCard({
                   <span className="truncate" title={f.description}>
                     {truncateMiddle(f.description, 48)}
                   </span>
-                  {/* Feature #2: local ACK */}
+                  {/* Escalation */}
+                  {(f.severity || "").toLowerCase() === "critical" &&
+                    isOld15m(f) && <Badge tone="red">Escalated</Badge>}
+                  {/* Note */}
+                  <FaultNoteButton
+                    f={f}
+                    faultNotes={faultNotes}
+                    setFaultNotes={setFaultNotes}
+                  />
+                  {/* Ack */}
                   {isAcked?.(f.id) ? (
                     <Badge tone="neutral">Ack</Badge>
                   ) : (
@@ -1253,6 +1440,7 @@ function AssetCard({
                       Ack
                     </button>
                   )}
+                  {/* Help */}
                   <button
                     className="rounded-md px-2 py-0.5 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
                     onClick={() =>
@@ -1267,6 +1455,22 @@ function AssetCard({
                     title="Request help"
                   >
                     Help
+                  </button>
+                  {/* AI Shops */}
+                  <button
+                    className="rounded-md px-2 py-0.5 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+                    onClick={() =>
+                      onFindShops?.({
+                        id,
+                        vin,
+                        lat,
+                        lon,
+                        faults: activeFaults,
+                      })
+                    }
+                    title="Find best service shops"
+                  >
+                    Find Shops
                   </button>
                 </div>
               ))}
@@ -1311,12 +1515,17 @@ function AssetCard({
   );
 }
 
+function isOld15m(f) {
+  const t = f?.time ? new Date(f.time).getTime() : 0;
+  return NOW() - t > 15 * 60 * 1000;
+}
+
 /* ---------------------------- Modal ---------------------------- */
 
-// Simple OSM embed helper (no API key). Keeps the map centered on latest lat/lon.
+// Simple OSM embed helper (keeps existing)
 function OsmMap({ lat, lon, zoom = 13, title = "Location" }) {
   if (lat == null || lon == null) return null;
-  const delta = 0.02; // viewport box size
+  const delta = 0.02;
   const bbox = [lon - delta, lat - delta, lon + delta, lat + delta].join("%2C");
   const src = `https://www.openstreetmap.org/export/embed.html?bbox=${bbox}&layer=mapnik&marker=${lat}%2C${lon}`;
   return (
@@ -1340,6 +1549,10 @@ function DetailsModal({
   onHelp,
   isAcked,
   onAck,
+  faultNotes,
+  setFaultNotes,
+  onFindShops,
+  isEscalated,
 }) {
   if (!row) return null;
   const {
@@ -1371,6 +1584,8 @@ function DetailsModal({
     .filter((e) => e.lat != null && e.lon != null)
     .slice(-25)
     .map((e) => ({ lat: e.lat, lon: e.lon }));
+
+  const firstFault = active[0];
 
   return (
     <div className="fixed inset-0 z-[70]">
@@ -1439,9 +1654,9 @@ function DetailsModal({
                   onHelp?.({
                     id,
                     vin,
-                    faultId: active[0]?.id,
-                    code: active[0]?.code,
-                    note: active[0]?.description || "",
+                    faultId: firstFault?.id,
+                    code: firstFault?.code,
+                    note: firstFault?.description || "",
                   })
                 }
               />
@@ -1462,12 +1677,18 @@ function DetailsModal({
                 }}
                 disabled={lat == null || lon == null}
               />
+              <Action
+                label="Find Shops"
+                onClick={() =>
+                  onFindShops?.({ id, vin, lat, lon, faults: active })
+                }
+                disabled={lat == null || lon == null}
+              />
             </div>
           </div>
 
           {/* Right: map, trends & faults */}
           <div className="space-y-3 md:col-span-2">
-            {/* Real-time map (OSM embed) */}
             <div className="space-y-2">
               <div className="text-xs text-neutral-500 dark:text-neutral-400">
                 Live location
@@ -1499,6 +1720,7 @@ function DetailsModal({
                           <th className="text-left px-2 py-1">Severity</th>
                           <th className="text-left px-2 py-1">When</th>
                           <th className="text-left px-2 py-1">KB</th>
+                          <th className="text-left px-2 py-1">Tags</th>
                           <th className="text-left px-2 py-1">Actions</th>
                         </tr>
                       </thead>
@@ -1508,6 +1730,7 @@ function DetailsModal({
                             const m = /SPN\s+(\d+)/i.exec(f.code || "");
                             return m ? Number(m[1]) : undefined;
                           })();
+                          const escal = isEscalated?.(f);
                           return (
                             <tr
                               key={f.id}
@@ -1543,7 +1766,20 @@ function DetailsModal({
                                 )}
                               </td>
                               <td className="px-2 py-1 space-x-1">
-                                {/* Ack */}
+                                {escal && <Badge tone="red">Escalated</Badge>}
+                                {/[1322|1327|1328]/ &&
+                                /misfire/i.test(
+                                  (f.description || "") + (f.code || "")
+                                ) ? (
+                                  <Badge tone="amber">Misfire</Badge>
+                                ) : null}
+                              </td>
+                              <td className="px-2 py-1 space-x-1">
+                                <FaultNoteButton
+                                  f={f}
+                                  faultNotes={faultNotes}
+                                  setFaultNotes={setFaultNotes}
+                                />
                                 {isAcked?.(f.id) ? (
                                   <Badge tone="neutral">Ack</Badge>
                                 ) : (
@@ -1554,7 +1790,6 @@ function DetailsModal({
                                     Ack
                                   </button>
                                 )}
-                                {/* Help */}
                                 <button
                                   className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
                                   onClick={() =>
@@ -1568,6 +1803,20 @@ function DetailsModal({
                                   }
                                 >
                                   Help
+                                </button>
+                                <button
+                                  className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+                                  onClick={() =>
+                                    onFindShops?.({
+                                      id,
+                                      vin,
+                                      lat,
+                                      lon,
+                                      faults: active,
+                                    })
+                                  }
+                                >
+                                  Find Shops
                                 </button>
                               </td>
                             </tr>
@@ -1727,7 +1976,15 @@ function TrailMini({ trail = [] }) {
   );
 }
 
-function FaultsCenter({ onClose, items, exportCsv }) {
+/* ------------------------- Faults Center ------------------------- */
+function FaultsCenter({
+  onClose,
+  items,
+  exportCsv,
+  watchlist,
+  setWatchlist,
+  onFindShops,
+}) {
   // Flatten all active faults
   const faults = [];
   for (const a of items) {
@@ -1741,6 +1998,8 @@ function FaultsCenter({ onClose, items, exportCsv }) {
         description: f.description,
         severity: (f.severity || "").toLowerCase(),
         time: f.time,
+        lat: a.lat,
+        lon: a.lon,
       });
     }
   }
@@ -1750,6 +2009,7 @@ function FaultsCenter({ onClose, items, exportCsv }) {
   );
   const topBySPN = topCounts(filtered.map((f) => f.code));
   const topByVIN = topCounts(filtered.map((f) => f.vin || f.assetId));
+  const [wlInput, setWlInput] = useState("");
 
   return (
     <div className="fixed inset-0 z-[75]">
@@ -1769,6 +2029,24 @@ function FaultsCenter({ onClose, items, exportCsv }) {
               <option value="warning">Warning</option>
               <option value="info">Info</option>
             </select>
+            <div className="flex items-center gap-1">
+              <input
+                value={wlInput}
+                onChange={(e) => setWlInput(e.target.value)}
+                placeholder="Add watch term (e.g., SPN 1322)"
+                className="rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm dark:bg-neutral-900 dark:border-neutral-800"
+              />
+              <button
+                className="rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm dark:bg-neutral-900 dark:border-neutral-800"
+                onClick={() => {
+                  if (!wlInput.trim()) return;
+                  setWatchlist((prev) => new Set([...prev, wlInput.trim()]));
+                  setWlInput("");
+                }}
+              >
+                Add
+              </button>
+            </div>
             <button
               onClick={exportCsv}
               className="rounded-xl border border-neutral-200 bg-white px-3 py-2 text-sm dark:bg-neutral-900 dark:border-neutral-800"
@@ -1846,7 +2124,7 @@ function FaultsCenter({ onClose, items, exportCsv }) {
                 <th className="text-left px-2 py-1">Code</th>
                 <th className="text-left px-2 py-1">Severity</th>
                 <th className="text-left px-2 py-1">Location</th>
-                <th className="text-left px-2 py-1">Desc</th>
+                <th className="text-left px-2 py-1">Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -1878,7 +2156,24 @@ function FaultsCenter({ onClose, items, exportCsv }) {
                       <td className="px-2 py-1">
                         {fmtLocation(f.city, f.state) || "—"}
                       </td>
-                      <td className="px-2 py-1 truncate">{f.description}</td>
+                      <td className="px-2 py-1">
+                        <button
+                          className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+                          onClick={() =>
+                            onFindShops?.({
+                              id: f.assetId,
+                              vin: f.vin,
+                              lat: f.lat,
+                              lon: f.lon,
+                              faults: [
+                                { code: f.code, description: f.description },
+                              ],
+                            })
+                          }
+                        >
+                          Find Shops
+                        </button>
+                      </td>
                     </tr>
                   ))
               )}
@@ -1890,254 +2185,376 @@ function FaultsCenter({ onClose, items, exportCsv }) {
   );
 }
 
-function topCounts(arr = []) {
-  const m = new Map();
-  for (const v of arr) m.set(v, (m.get(v) || 0) + 1);
-  return [...m.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
-}
+/* ------------------ Live Fleet Map (real-time) ------------------ */
 
-function Fact({ label, children }) {
-  return (
-    <div>
-      <div className="text-[11px] uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
-        {label}
-      </div>
-      <div className="text-sm">{children}</div>
-    </div>
-  );
-}
-function Action({ label, onClick, disabled }) {
-  return (
-    <button
-      disabled={disabled}
-      onClick={onClick}
-      className={cx(
-        "rounded-xl px-3 py-2 text-sm ring-1 transition",
-        disabled
-          ? "bg-neutral-100 text-neutral-400 ring-neutral-200 dark:bg-neutral-800 dark:text-neutral-600 dark:ring-neutral-700"
-          : "bg-gradient-to-br from-emerald-500 to-cyan-500 text-white ring-emerald-400/40 hover:brightness-105"
-      )}
-    >
-      {label}
-    </button>
-  );
-}
-
-function Field({ label, children }) {
-  return (
-    <div className="min-w-0">
-      <div className="text-[11px] uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
-        {label}
-      </div>
-      <div className="text-sm text-neutral-900 dark:text-neutral-100 min-w-0 break-words truncate">
-        {children || "—"}
-      </div>
-    </div>
-  );
-}
-function Mono({ value, max = 20 }) {
-  if (!value) return <span>—</span>;
-  const text = String(value);
-  const short = truncateMiddle(text, max);
-  return (
-    <span
-      className="font-mono text-sm text-neutral-900 dark:text-neutral-100 truncate max-w-[26ch]"
-      title={text}
-    >
-      {short}
-    </span>
-  );
-}
-function HeadingPill({ heading }) {
-  if (heading == null) return <Badge tone="neutral">—</Badge>;
-  const n = ((Math.round(heading) % 360) + 360) % 360;
-  const arrow =
-    n >= 337.5 || n < 22.5
-      ? "⬆︎"
-      : n < 67.5
-      ? "↗︎"
-      : n < 112.5
-      ? "➡︎"
-      : n < 157.5
-      ? "↘︎"
-      : n < 202.5
-      ? "⬇︎"
-      : n < 247.5
-      ? "↙︎"
-      : n < 292.5
-      ? "⬅︎"
-      : "↖︎";
-  return (
-    <span className="inline-flex select-none items-center gap-1 rounded-xl bg-neutral-100 px-2 py-1 text-[11px] font-medium text-neutral-800 ring-1 ring-inset ring-neutral-200 dark:bg-neutral-800 dark:text-neutral-200 dark:ring-neutral-700">
-      <span aria-hidden>{arrow}</span>
-      <span>{Math.round(heading)}°</span>
-    </span>
-  );
-}
-function CopyBtn({
-  value,
-  title = "Copy",
-  label = "Copy",
-  disabled = false,
-  onCopy,
-}) {
-  return (
-    <button
-      type="button"
-      disabled={disabled || !value}
-      className={cx(
-        "rounded-lg px-2 py-1 text-[11px] ring-1",
-        disabled || !value
-          ? "text-neutral-400 bg-neutral-50 ring-neutral-200 dark:bg-neutral-900/40 dark:text-neutral-600 dark:ring-neutral-800"
-          : "text-neutral-700 bg-white ring-neutral-200 hover:bg-neutral-50 dark:bg-neutral-900 dark:text-neutral-200 dark:ring-neutral-700 dark:hover:bg-neutral-800"
-      )}
-      title={title}
-      onClick={() => {
-        if (value) {
-          navigator.clipboard?.writeText(String(value));
-          onCopy?.();
-        }
-      }}
-    >
-      {label}
-    </button>
-  );
-}
-function Sparkline({ values = [] }) {
-  const W = 260,
-    H = 34,
-    pad = 2,
-    n = values.length;
-  if (n <= 1)
+function LiveFleetMap({ items = [], trailsRef, lastPointRef, onPick }) {
+  // compute bounds
+  const pts = items
+    .filter((r) => r.lat != null && r.lon != null)
+    .map((r) => ({ id: r.id, lat: r.lat, lon: r.lon }));
+  if (pts.length === 0)
     return (
-      <div className="h-[34px] text-[11px] text-neutral-400 dark:text-neutral-500 flex items-center">
-        No speed history
+      <div className="rounded-3xl border border-dashed border-neutral-300 bg-white p-8 text-center shadow-sm dark:bg-neutral-900 dark:border-neutral-800">
+        <div className="text-sm text-neutral-600 dark:text-neutral-300">
+          No GPS positions to show on the live map.
+        </div>
       </div>
     );
-  const maxVal = Math.max(1, ...values);
-  const stepX = (W - pad * 2) / (n - 1);
-  const points = values
-    .map((v, i) => {
-      const x = pad + i * stepX;
-      const y = pad + (H - pad * 2) * (1 - v / maxVal);
-      return `${x},${y}`;
-    })
-    .join(" ");
-  const last = values[n - 1];
+
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    let raf;
+    const loop = () => {
+      setTick((t) => (t + 1) % 1_000_000);
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  // keep an animated position per asset (lerped toward lastPoint)
+  const animRef = useRef(new Map()); // id -> { x, y, tx, ty }
+
+  // compute bounds from current points (pad a bit)
+  const lats = pts.map((p) => p.lat);
+  const lons = pts.map((p) => p.lon);
+  const minLat = Math.min(...lats),
+    maxLat = Math.max(...lats);
+  const minLon = Math.min(...lons),
+    maxLon = Math.max(...lons);
+  const pad = 0.02;
+  const bMinLat = minLat - pad,
+    bMaxLat = maxLat + pad;
+  const bMinLon = minLon - pad,
+    bMaxLon = maxLon + pad;
+
+  const W = 1050,
+    H = 520,
+    inset = 16;
+
+  const scaleX = (lon) =>
+    inset +
+    ((lon - bMinLon) / Math.max(1e-9, bMaxLon - bMinLon)) * (W - inset * 2);
+  const scaleY = (lat) =>
+    inset +
+    (1 - (lat - bMinLat) / Math.max(1e-9, bMaxLat - bMinLat)) * (H - inset * 2);
+
+  // update targets from latest points every render; lerp in place via tick
+  for (const p of pts) {
+    const last = lastPointRef.current.get(p.id) || { lat: p.lat, lon: p.lon };
+    const tx = scaleX(last.lon ?? p.lon);
+    const ty = scaleY(last.lat ?? p.lat);
+    const cur = animRef.current.get(p.id) || {
+      x: tx,
+      y: ty,
+      tx,
+      ty,
+    };
+    cur.tx = tx;
+    cur.ty = ty;
+    // ease 15% towards target on each frame
+    cur.x += (cur.tx - cur.x) * 0.15;
+    cur.y += (cur.ty - cur.y) * 0.15;
+    animRef.current.set(p.id, cur);
+  }
+
+  // trails (last 25 points each)
+  const trails = new Map();
+  for (const r of items) {
+    const ev = (trailsRef.current.get(r.id) || []).slice(-25);
+    const tpts = ev
+      .filter((e) => e.lat != null && e.lon != null)
+      .map((e) => [scaleX(e.lon), scaleY(e.lat)]);
+    trails.set(r.id, tpts);
+  }
+
   return (
-    <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[34px]">
-      <polyline
-        fill="none"
-        stroke="currentColor"
-        strokeWidth="2"
-        points={points}
-        className="text-neutral-400 dark:text-neutral-500"
-      />
-      <circle
-        cx={pad + (n - 1) * stepX}
-        cy={pad + (H - pad * 2) * (1 - last / maxVal)}
-        r="2.5"
-        className="text-neutral-700 dark:text-neutral-300"
-        fill="currentColor"
-      />
-    </svg>
-  );
-}
-function EmptyState({ connected, ws, snapshot }) {
-  return (
-    <div className="rounded-3xl border border-dashed border-neutral-300 bg-white p-10 text-center shadow-sm dark:bg-neutral-900 dark:border-neutral-800">
-      <div className="mx-auto mb-3 grid h-12 w-12 place-items-center rounded-2xl bg-neutral-100 dark:bg-neutral-800">
-        <span aria-hidden className="text-lg">
-          🚚
-        </span>
+    <div className="rounded-3xl border border-neutral-200 bg-white p-3 shadow-sm dark:bg-neutral-900 dark:border-neutral-800">
+      <div className="flex items-center justify-between px-2 pb-2">
+        <div className="text-sm text-neutral-600 dark:text-neutral-300">
+          Live Fleet Map (auto-fit) • {items.length} assets
+        </div>
+        <div className="text-xs text-neutral-500 dark:text-neutral-400">
+          Click a dot to open details
+        </div>
       </div>
-      <h2 className="text-lg font-semibold">Waiting for trucks…</h2>
-      <p className="mx-auto mt-1 max-w-md text-sm text-neutral-600 dark:text-neutral-400">
-        As soon as the server sends a snapshot or updates, your live cards will
-        appear here.
-      </p>
-      <div className="mt-4 inline-flex items-center gap-2 rounded-xl bg-neutral-50 px-3 py-1.5 text-xs text-neutral-600 ring-1 ring-neutral-200 dark:bg-neutral-800 dark:text-neutral-300 dark:ring-neutral-700">
-        <StatusDot ok={connected} />
-        <span className="truncate max-w-[42ch]">{ws}</span>
-        <span className="text-neutral-300 dark:text-neutral-600">•</span>
-        <span>snapshot: {snapshot}</span>
+      <div className="w-full overflow-auto">
+        <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-[520px]">
+          {/* background */}
+          <rect
+            x="0"
+            y="0"
+            width={W}
+            height={H}
+            className="fill-neutral-50 dark:fill-neutral-800"
+          />
+          {/* frame */}
+          <rect
+            x={inset - 8}
+            y={inset - 8}
+            width={W - (inset - 8) * 2}
+            height={H - (inset - 8) * 2}
+            className="fill-none"
+            stroke="currentColor"
+            strokeOpacity="0.08"
+          />
+
+          {/* draw trails */}
+          {[...trails.entries()].map(([id, pts]) =>
+            pts.length > 1 ? (
+              <polyline
+                key={`trail-${id}`}
+                points={pts.map(([x, y]) => `${x},${y}`).join(" ")}
+                fill="none"
+                stroke="currentColor"
+                strokeOpacity="0.35"
+                strokeWidth="2"
+                className="text-neutral-400 dark:text-neutral-500"
+              />
+            ) : null
+          )}
+
+          {/* draw moving dots */}
+          {items
+            .filter((r) => r.lat != null && r.lon != null)
+            .map((r) => {
+              const pos = animRef.current.get(r.id);
+              const label =
+                r.vin || (typeof r.id === "string" ? r.id : String(r.id));
+              return (
+                <g
+                  key={r.id}
+                  className="cursor-pointer"
+                  onClick={() => onPick?.(r.id)}
+                >
+                  {/* pulse ring for recently-updated */}
+                  {r.__hot && NOW() - r.__hot < 1500 ? (
+                    <circle
+                      cx={pos?.x ?? 0}
+                      cy={pos?.y ?? 0}
+                      r="10"
+                      fill="none"
+                      stroke="currentColor"
+                      strokeOpacity="0.25"
+                      className="text-emerald-500"
+                    />
+                  ) : null}
+                  <circle
+                    cx={pos?.x ?? 0}
+                    cy={pos?.y ?? 0}
+                    r="4.5"
+                    className={
+                      (r.mph ?? 0) >= 1 ? "fill-emerald-500" : "fill-amber-500"
+                    }
+                  />
+                  <text
+                    x={(pos?.x ?? 0) + 7}
+                    y={(pos?.y ?? 0) - 7}
+                    fontSize="11"
+                    className="fill-neutral-700 dark:fill-neutral-200"
+                  >
+                    {truncateMiddle(label, 12)}
+                  </text>
+                </g>
+              );
+            })}
+        </svg>
       </div>
     </div>
   );
 }
 
-/* ----------------------- CSV helpers ----------------------- */
+/* ------------------------- Small helpers ------------------------- */
 
-function exportCsv(list) {
-  if (!list.length) return;
-  const cols = [
-    "id",
-    "vin",
-    "serial",
-    "time",
-    "mph",
-    "lat",
-    "lon",
-    "heading",
-    "city",
-    "state",
-    "lastTopic",
-  ];
-  const header = cols.join(",");
-  const rows = list.map((r) =>
-    cols
-      .map((c) => {
-        const v = r[c] == null ? "" : String(r[c]);
-        return /[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
-      })
-      .join(",")
-  );
-  downloadBlob(
-    [header, ...rows].join("\n"),
-    `fleet_${new Date().toISOString().slice(0, 19)}.csv`,
-    "text/csv;charset=utf-8"
+function FaultNoteButton({ f, faultNotes, setFaultNotes }) {
+  const [open, setOpen] = useState(false);
+  const [text, setText] = useState(() => faultNotes.get(f.id) || "");
+
+  useEffect(() => {
+    setText(faultNotes.get(f.id) || "");
+  }, [f?.id]); // eslint-disable-line
+
+  return (
+    <div className="relative inline-block">
+      <button
+        className="rounded-md px-2 py-0.5 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+        onClick={() => setOpen((v) => !v)}
+        title="Add/View note"
+      >
+        Note
+      </button>
+      {open && (
+        <div className="absolute z-20 mt-1 w-64 rounded-xl border border-neutral-200 bg-white p-2 shadow-xl dark:bg-neutral-900 dark:border-neutral-700">
+          <textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            rows={4}
+            placeholder="Add a short note…"
+            className="w-full rounded-lg border border-neutral-200 bg-white p-2 text-sm outline-none dark:bg-neutral-900 dark:border-neutral-700"
+          />
+          <div className="mt-2 flex items-center justify-between">
+            <button
+              className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+              onClick={() => {
+                setFaultNotes((prev) => {
+                  const m = new Map(prev);
+                  if (text.trim()) m.set(f.id, text.trim());
+                  else m.delete(f.id);
+                  return m;
+                });
+                setOpen(false);
+              }}
+            >
+              Save
+            </button>
+            <button
+              className="rounded-md px-2 py-1 text-[11px] ring-1 ring-neutral-300 dark:ring-neutral-700"
+              onClick={() => {
+                setText("");
+                setFaultNotes((prev) => {
+                  const m = new Map(prev);
+                  m.delete(f.id);
+                  return m;
+                });
+                setOpen(false);
+              }}
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
   );
 }
-function exportFaultsCsv(list) {
-  const rows = [];
-  rows.push(
-    ["vin", "id", "code", "severity", "active", "time", "city", "state"].join(
-      ","
-    )
+
+/* ------------------------- Shop Finder ------------------------- */
+
+function ShopFinderModal({ state, onClose }) {
+  const { loading, results = [], q, err } = state || {};
+  return (
+    <div className="fixed inset-0 z-[80]">
+      <div
+        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+        onClick={onClose}
+      />
+      <div className="absolute left-1/2 top-1/2 w-[min(100vw-2rem,900px)] -translate-x-1/2 -translate-y-1/2 rounded-2xl border border-neutral-200 bg-white shadow-2xl dark:bg-neutral-900 dark:border-neutral-800">
+        <div className="flex items-center justify-between gap-3 border-b border-neutral-100 p-4 dark:border-neutral-800">
+          <div className="flex items-center gap-2">
+            <Badge tone="violet">AI Shop Finder</Badge>
+            {q?.vin ? (
+              <span className="text-sm text-neutral-600 dark:text-neutral-300">
+                for{" "}
+                <span className="font-mono">{truncateMiddle(q.vin, 20)}</span>
+              </span>
+            ) : null}
+          </div>
+          <button
+            className="rounded-xl border border-neutral-200 bg-white px-3 py-1.5 text-sm text-neutral-700 hover:bg-neutral-50 dark:bg-neutral-900 dark:text-neutral-200 dark:border-neutral-700 dark:hover:bg-neutral-800"
+            onClick={onClose}
+          >
+            Close ✕
+          </button>
+        </div>
+
+        <div className="p-4">
+          {loading ? (
+            <div className="grid place-items-center py-12">
+              <div className="animate-pulse text-sm text-neutral-600 dark:text-neutral-300">
+                Finding best shops near {q?.lat?.toFixed?.(3)},
+                {q?.lon?.toFixed?.(3)}…
+              </div>
+            </div>
+          ) : err ? (
+            <div className="text-sm text-rose-600">{err}</div>
+          ) : results.length === 0 ? (
+            <div className="text-sm text-neutral-600 dark:text-neutral-300">
+              No shops found for the current selection.
+            </div>
+          ) : (
+            <div className="grid gap-3">
+              {results.map((r, i) => (
+                <div
+                  key={r.id || i}
+                  className="rounded-xl border border-neutral-200 bg-neutral-50 p-3 dark:bg-neutral-800 dark:border-neutral-700"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="text-base font-semibold">
+                        {r.name || "Service Shop"}
+                        {r.chain ? (
+                          <span className="ml-2 text-xs font-medium text-neutral-500 dark:text-neutral-400">
+                            ({r.chain})
+                          </span>
+                        ) : null}
+                      </div>
+                      <div className="text-xs text-neutral-600 dark:text-neutral-300">
+                        {r.address || "—"}
+                      </div>
+                      {Array.isArray(q?.codes) && q.codes.length > 0 ? (
+                        <div className="mt-1 text-[11px] text-neutral-500 dark:text-neutral-400">
+                          Matches: {q.codes.join(", ")}
+                        </div>
+                      ) : null}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      {Number.isFinite(r.distanceMi) && (
+                        <Badge tone="emerald">
+                          {r.distanceMi.toFixed(1)} mi
+                        </Badge>
+                      )}
+                      {r.etaMin != null && (
+                        <Badge tone="blue">{r.etaMin} min ETA</Badge>
+                      )}
+                      {r.priceEstimate != null && (
+                        <Badge tone="amber">${r.priceEstimate} est.</Badge>
+                      )}
+                      {r.score != null && (
+                        <Badge tone="violet">
+                          Score {r.score.toFixed?.(1)}
+                        </Badge>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    {r.phone && (
+                      <a
+                        href={`tel:${r.phone}`}
+                        className="rounded-xl px-3 py-1.5 text-sm ring-1 ring-neutral-300 dark:ring-neutral-700"
+                      >
+                        Call
+                      </a>
+                    )}
+                    {Number.isFinite(r.lat) && Number.isFinite(r.lon) && (
+                      <a
+                        href={`https://www.google.com/maps?q=${r.lat},${
+                          r.lon
+                        }(${encodeURIComponent(r.name || "Shop")})`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="rounded-xl px-3 py-1.5 text-sm ring-1 ring-neutral-300 dark:ring-neutral-700"
+                      >
+                        Open in Maps ↗
+                      </a>
+                    )}
+                    {r.quoteUrl && (
+                      <a
+                        href={r.quoteUrl}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="rounded-xl px-3 py-1.5 text-sm ring-1 ring-neutral-300 dark:ring-neutral-700"
+                      >
+                        View Quote
+                      </a>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
   );
-  for (const r of list) {
-    for (const f of r.faults?.active || []) {
-      const vals = [
-        r.vin || "",
-        r.id || "",
-        f.code || "",
-        f.severity || "",
-        String(!!f.active),
-        f.time || "",
-        r.city || "",
-        r.state || "",
-      ].map((v) =>
-        /[",\n]/.test(String(v))
-          ? `"${String(v).replace(/"/g, '""')}"`
-          : String(v)
-      );
-      rows.push(vals.join(","));
-    }
-  }
-  downloadBlob(
-    rows.join("\n"),
-    `faults_${new Date().toISOString().slice(0, 19)}.csv`,
-    "text/csv;charset=utf-8"
-  );
-}
-function downloadBlob(text, name, type) {
-  const blob = new Blob([text], { type });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement("a");
-  a.href = url;
-  a.download = name;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(url);
 }
